@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
@@ -10,11 +10,12 @@ import shutil
 
 from app.config_ini import config
 from app.logger import logger
-from app.database import init_db, get_db, Device, MeterExcelData, MeterImageData, Notification, DataStatistics, \
+from app.database import init_db, get_db, SessionLocal, Device, MeterExcelData, MeterImageData, Notification, DataStatistics, \
     DataType, Hardware_Key
+from app.websocket_manager import ws_manager
 from app.security import security_manager
 from app.utils import image_compressor
-from app.meter_utils import meter_excel_parser, meter_image_classifier
+from app.meter_utils import meter_image_classifier
 from app.schemas import (
     DeviceCreate, DeviceAuthenticate, DeviceResponse,
     MeterExcelDataResponse, MeterImageDataResponse,
@@ -22,6 +23,70 @@ from app.schemas import (
 )
 
 app = FastAPI(title="三相表数据管理系统")
+
+
+# ==================== WebSocket 长连接 ====================
+@app.websocket("/ws/upper")
+async def websocket_upper(websocket: WebSocket, device_id: Optional[str] = None):
+    """
+    上位机通知通道：
+    - 可通过 query ?device_id=xxx 只接收指定设备的通知
+    - 支持简单 ping/pong 保活
+    """
+    await ws_manager.connect(websocket, client_type="upper", device_id=device_id)
+    try:
+        while True:
+            data = await websocket.receive_text()
+            if data.strip().lower() == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        ws_manager.disconnect(websocket)
+    except Exception as e:
+        logger.error(f"WebSocket (upper) error: {e}")
+        ws_manager.disconnect(websocket)
+
+
+@app.websocket("/ws/device/{device_id}")
+async def websocket_device(websocket: WebSocket, device_id: str, hardware_key: str):
+    """
+    下位机长连接通道：
+    - 连接时校验 hardware_key
+    - 将设备标记为 online/离线
+    - 支持简单 ping/pong
+    """
+    db = SessionLocal()
+    device = None
+    try:
+        device = db.query(Device).filter(Device.device_id == device_id).first()
+        if not device or not security_manager.verify_hardware_key(hardware_key, device.hardware_key):
+            logger.warning(f"WebSocket device auth failed: {device_id}")
+            await websocket.close(code=1008)
+            return
+
+        device.status = "online"
+        device.updated_at = datetime.now()
+        db.commit()
+
+        await ws_manager.connect(websocket, client_type="device", device_id=device_id)
+
+        while True:
+            data = await websocket.receive_text()
+            if data.strip().lower() == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        logger.info(f"Device websocket disconnected: {device_id}")
+    except Exception as e:
+        logger.error(f"WebSocket (device) error: {e}")
+    finally:
+        if device:
+            try:
+                device.status = "offline"
+                device.updated_at = datetime.now()
+                db.commit()
+            except Exception as e:
+                logger.error(f"Failed to update device offline status: {e}")
+        db.close()
+        ws_manager.disconnect(websocket)
 
 
 @app.on_event("startup")
@@ -199,23 +264,33 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==================== 电量数据接口 ====================
+# ==================== WebSocket 通知函数 ====================
 
-async def notify_excel_upload(device_id: str, file_info: dict, db: Session):
-    """通知电量数据上传"""
+async def send_ws_notification(notification_type: str, device_id: str, file_info: dict):
+    """发送 WebSocket 通知"""
     try:
-        notification = Notification(
-            device_id=device_id,
-            notification_type="excel_upload",
-            message=f"电量数据上传: {file_info['file_name']}",
-            status="unread"
-        )
-        db.add(notification)
-        db.commit()
-
-        logger.info(f"电量数据上传通知已创建: {device_id}")
+        payload = {
+            "type": notification_type,
+            "device_id": device_id,
+            "file_id": file_info.get("file_id"),
+            "file_name": file_info.get("file_name"),
+            "file_size": file_info.get("file_size"),
+            "data_type": file_info.get("data_type", ""),
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        # 如果是图片，添加额外信息
+        if notification_type == "image_upload":
+            payload["original_size"] = file_info.get("original_size")
+            payload["compression_ratio"] = file_info.get("compression_ratio")
+        
+        await ws_manager.broadcast_notification(payload)
+        logger.info(f"WebSocket 通知已发送: {notification_type} - {device_id} - {file_info.get('file_name')}")
     except Exception as e:
-        logger.error(f"Failed to create excel notification: {e}")
+        logger.error(f"Failed to send WebSocket notification: {e}")
+
+
+# ==================== 电量数据接口 ====================
 
 
 async def upload_excel_data(
@@ -256,33 +331,13 @@ async def upload_excel_data(
 
         file_size = len(file_content)
 
-        # 解析Excel数据
-        excel_data = meter_excel_parser.parse_excel(file_path)
-
-        # 更新设备信息
-        if meter_model:
-            device.meter_model = meter_model
-        if meter_sn:
-            device.meter_sn = meter_sn
-        device.updated_at = datetime.now()
-
-        # 创建数据记录
+        # 创建数据记录（不解析 Excel，由上位机自行解析）
         excel_record = MeterExcelData(
             device_id=device_id,
             file_name=filename,
             file_path=str(file_path),
             file_size=file_size,
-            description=description or f"电量数据 - {timestamp}",
-            measurement_date=excel_data.get('measurement_date'),
-            meter_reading=excel_data.get('meter_reading'),
-            total_energy=excel_data.get('total_energy'),
-            a_phase_voltage=excel_data.get('a_phase_voltage'),
-            b_phase_voltage=excel_data.get('b_phase_voltage'),
-            c_phase_voltage=excel_data.get('c_phase_voltage'),
-            a_phase_current=excel_data.get('a_phase_current'),
-            b_phase_current=excel_data.get('b_phase_current'),
-            c_phase_current=excel_data.get('c_phase_current'),
-            power_factor=excel_data.get('power_factor')
+            description=description or f"电量数据 - {timestamp}"
         )
 
         db.add(excel_record)
@@ -292,13 +347,24 @@ async def upload_excel_data(
         # 更新统计
         update_statistics(db, device_id, "excel", file_size)
 
-        # 后台任务：通知上位机
+        # 创建数据库通知记录
+        notification = Notification(
+            device_id=device_id,
+            notification_type="excel_upload",
+            message=f"电量数据上传: {filename}",
+            status="unread"
+        )
+        db.add(notification)
+        db.commit()
+
+        # 后台任务：通过 WebSocket 通知上位机
         file_info = {
+            "file_id": excel_record.id,  # 添加 file_id
             "file_name": filename,
             "file_size": file_size,
             "data_type": "电量数据"
         }
-        background_tasks.add_task(notify_excel_upload, device_id, file_info, db)
+        background_tasks.add_task(send_ws_notification, "excel_upload", device_id, file_info)
 
         logger.info(f"电量数据上传成功: {device_id}/{filename} ({file_size} bytes)")
 
@@ -308,19 +374,7 @@ async def upload_excel_data(
             "data_type": "excel",
             "file_id": excel_record.id,
             "file_name": filename,
-            "file_size": file_size,
-            "parsed_data": {
-                "measurement_date": excel_data.get('measurement_date'),
-                "meter_reading": excel_data.get('meter_reading'),
-                "total_energy": excel_data.get('total_energy'),
-                "a_phase_voltage": excel_data.get('a_phase_voltage'),
-                "b_phase_voltage": excel_data.get('b_phase_voltage'),
-                "c_phase_voltage": excel_data.get('c_phase_voltage'),
-                "a_phase_current": excel_data.get('a_phase_current'),
-                "b_phase_current": excel_data.get('b_phase_current'),
-                "c_phase_current": excel_data.get('c_phase_current'),
-                "power_factor": excel_data.get('power_factor')
-            }
+            "file_size": file_size
         }
 
     except HTTPException:
@@ -355,23 +409,6 @@ async def upload_excel_endpoint(
 
 
 # ==================== 几何量数据接口 ====================
-
-async def notify_image_upload(device_id: str, file_info: dict, db: Session):
-    """通知几何量数据上传"""
-    try:
-        notification = Notification(
-            device_id=device_id,
-            notification_type="image_upload",
-            message=f"几何量数据上传: {file_info['file_name']}",
-            status="unread"
-        )
-        db.add(notification)
-        db.commit()
-
-        logger.info(f"几何量数据上传通知已创建: {device_id}")
-    except Exception as e:
-        logger.error(f"Failed to create image notification: {e}")
-
 
 async def upload_image_data(
         background_tasks: BackgroundTasks,
@@ -446,15 +483,26 @@ async def upload_image_data(
         # 更新统计
         update_statistics(db, device_id, "image", compressed_size, original_size)
 
-        # 后台任务：通知上位机
+        # 创建数据库通知记录
+        notification = Notification(
+            device_id=device_id,
+            notification_type="image_upload",
+            message=f"几何量数据上传: {filename}",
+            status="unread"
+        )
+        db.add(notification)
+        db.commit()
+
+        # 后台任务：通过 WebSocket 通知上位机
         file_info = {
+            "file_id": image_record.id,  # 添加 file_id
             "file_name": filename,
             "file_size": compressed_size,
             "original_size": original_size,
             "compression_ratio": compression_ratio,
             "data_type": "几何量数据"
         }
-        background_tasks.add_task(notify_image_upload, device_id, file_info, db)
+        background_tasks.add_task(send_ws_notification, "image_upload", device_id, file_info)
 
         logger.info(
             f"几何量数据上传成功: {device_id}/{filename} "
@@ -533,17 +581,7 @@ async def get_excel_data(
                     "file_path": f.file_path,
                     "file_size": f.file_size,
                     "upload_time": f.upload_time.isoformat(),
-                    "description": f.description,
-                    "measurement_date": f.measurement_date.isoformat() if f.measurement_date else None,
-                    "meter_reading": f.meter_reading,
-                    "total_energy": f.total_energy,
-                    "a_phase_voltage": f.a_phase_voltage,
-                    "b_phase_voltage": f.b_phase_voltage,
-                    "c_phase_voltage": f.c_phase_voltage,
-                    "a_phase_current": f.a_phase_current,
-                    "b_phase_current": f.b_phase_current,
-                    "c_phase_current": f.c_phase_current,
-                    "power_factor": f.power_factor
+                    "description": f.description
                 }
                 for f in files
             ]
@@ -673,17 +711,7 @@ async def get_excel_detail(file_id: int, db: Session = Depends(get_db)):
                 "file_path": file_record.file_path,
                 "file_size": file_record.file_size,
                 "upload_time": file_record.upload_time.isoformat(),
-                "description": file_record.description,
-                "measurement_date": file_record.measurement_date.isoformat() if file_record.measurement_date else None,
-                "meter_reading": file_record.meter_reading,
-                "total_energy": file_record.total_energy,
-                "a_phase_voltage": file_record.a_phase_voltage,
-                "b_phase_voltage": file_record.b_phase_voltage,
-                "c_phase_voltage": file_record.c_phase_voltage,
-                "a_phase_current": file_record.a_phase_current,
-                "b_phase_current": file_record.b_phase_current,
-                "c_phase_current": file_record.c_phase_current,
-                "power_factor": file_record.power_factor
+                "description": file_record.description
             }
         }
     except HTTPException:

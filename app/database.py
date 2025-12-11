@@ -57,7 +57,7 @@ class Device(Base):
 
 # ==================== 电量数据表 ====================
 class MeterExcelData(Base):
-    """电量数据 - Excel文件记录"""
+    """电量数据 - Excel文件记录（仅存储文件信息，不解析数据）"""
     __tablename__ = "meter_excel_data"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -67,18 +67,6 @@ class MeterExcelData(Base):
     file_size = Column(BigInteger)
     upload_time = Column(DateTime, default=datetime.now, index=True)
     description = Column(Text)
-
-    # 电量数据特定字段
-    measurement_date = Column(DateTime)  # 测量日期
-    meter_reading = Column(Float)  # 电表读数
-    total_energy = Column(Float)  # 总电能
-    a_phase_voltage = Column(Float)  # A相电压
-    b_phase_voltage = Column(Float)  # B相电压
-    c_phase_voltage = Column(Float)  # C相电压
-    a_phase_current = Column(Float)  # A相电流
-    b_phase_current = Column(Float)  # B相电流
-    c_phase_current = Column(Float)  # C相电流
-    power_factor = Column(Float)  # 功率因数
 
 
 # ==================== 几何量数据表 ====================
