@@ -25,6 +25,7 @@ class DeviceAuthenticate(BaseModel):
     device_id: str
     hardware_key: str
     device_ip: Optional[str] = None
+    location: Optional[str] = None
 
 class DeviceResponse(BaseModel):
     device_id: str

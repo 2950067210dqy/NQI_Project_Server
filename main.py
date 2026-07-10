@@ -1,5 +1,6 @@
-from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, Form, Depends, HTTPException, BackgroundTasks, Query
 from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
 from typing import Optional, List
@@ -7,12 +8,12 @@ import aiofiles
 from pathlib import Path
 from datetime import datetime, timedelta
 import shutil
+import asyncio
 
 from app.config_ini import config
 from app.logger import logger
 from app.database import init_db, get_db, SessionLocal, Device, MeterExcelData, MeterImageData, Notification, DataStatistics, \
-    DataType, Hardware_Key
-from app.websocket_manager import ws_manager
+    DataType, Hardware_Key, DeviceRegistrationRequest, FaultRecord, DataSearchIndex
 from app.security import security_manager
 from app.utils import image_compressor
 from app.meter_utils import meter_image_classifier
@@ -21,72 +22,23 @@ from app.schemas import (
     MeterExcelDataResponse, MeterImageDataResponse,
     NotificationResponse, DataStatisticsResponse
 )
+from app.feature_routes import router as feature_router
+from app.feature_services import (
+    detect_fault_flag, create_search_index, create_fault_if_needed,
+    remember_polling_notification, create_alarm_notification, extract_excel_metrics,
+    build_image_metrics, evaluate_alarm_rules, merge_fault_summary, create_upload_error_notification,
+    infer_location
+)
+from app.server_processing_runtime import (
+    start_processing_workers,
+    stop_processing_workers,
+    serialize_excel_record,
+    serialize_image_record,
+)
 
 app = FastAPI(title="三相表数据管理系统")
-
-
-# ==================== WebSocket 长连接 ====================
-@app.websocket("/ws/upper")
-async def websocket_upper(websocket: WebSocket, device_id: Optional[str] = None):
-    """
-    上位机通知通道：
-    - 可通过 query ?device_id=xxx 只接收指定设备的通知
-    - 支持简单 ping/pong 保活
-    """
-    await ws_manager.connect(websocket, client_type="upper", device_id=device_id)
-    try:
-        while True:
-            data = await websocket.receive_text()
-            if data.strip().lower() == "ping":
-                await websocket.send_text("pong")
-    except WebSocketDisconnect:
-        ws_manager.disconnect(websocket)
-    except Exception as e:
-        logger.error(f"WebSocket (upper) error: {e}")
-        ws_manager.disconnect(websocket)
-
-
-@app.websocket("/ws/device/{device_id}")
-async def websocket_device(websocket: WebSocket, device_id: str, hardware_key: str):
-    """
-    下位机长连接通道：
-    - 连接时校验 hardware_key
-    - 将设备标记为 online/离线
-    - 支持简单 ping/pong
-    """
-    db = SessionLocal()
-    device = None
-    try:
-        device = db.query(Device).filter(Device.device_id == device_id).first()
-        if not device or not security_manager.verify_hardware_key(hardware_key, device.hardware_key):
-            logger.warning(f"WebSocket device auth failed: {device_id}")
-            await websocket.close(code=1008)
-            return
-
-        device.status = "online"
-        device.updated_at = datetime.now()
-        db.commit()
-
-        await ws_manager.connect(websocket, client_type="device", device_id=device_id)
-
-        while True:
-            data = await websocket.receive_text()
-            if data.strip().lower() == "ping":
-                await websocket.send_text("pong")
-    except WebSocketDisconnect:
-        logger.info(f"Device websocket disconnected: {device_id}")
-    except Exception as e:
-        logger.error(f"WebSocket (device) error: {e}")
-    finally:
-        if device:
-            try:
-                device.status = "offline"
-                device.updated_at = datetime.now()
-                db.commit()
-            except Exception as e:
-                logger.error(f"Failed to update device offline status: {e}")
-        db.close()
-        ws_manager.disconnect(websocket)
+app.mount("/uploads", StaticFiles(directory=str(config.upload_dir.resolve()), check_dir=False), name="uploads")
+app.include_router(feature_router)
 
 
 @app.on_event("startup")
@@ -94,12 +46,16 @@ async def startup_event():
     """启动事件"""
     init_db()
     config.upload_dir.mkdir(parents=True, exist_ok=True)
+    # 启动两个后台处理线程，持续扫描待解析的 Excel 与图片记录。
+    start_processing_workers()
     logger.info("Three-Phase Meter Server started successfully")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """关闭事件"""
+    # 关闭服务时优雅停止后台解析线程，避免残留轮询任务。
+    stop_processing_workers()
     logger.info("Server shutting down")
 
 
@@ -111,39 +67,83 @@ async def register_device(
         device_name: str = Form(...),
         hardware_key: str = Form(...),
         device_ip: str = Form(None),
+        location: str = Form(None),
 
         db: Session = Depends(get_db)
 ):
-    """设备注册"""
+    """提交设备注册申请；只有审批通过后设备才可认证连接。"""
     try:
-        #检查硬件码是否在数据库里
-        existing_hardware_key = db.query(Hardware_Key).filter(Hardware_Key.hardware_key == hardware_key).first()
-        if not existing_hardware_key:
-            raise HTTPException(status_code=400, detail="hardware_key not exists in server")
-        # 检查设备是否已存在
+        # 已经通过审批并落库的设备，重复注册时直接返回已审批状态。
         existing_device = db.query(Device).filter(Device.device_id == device_id).first()
         if existing_device:
-            raise HTTPException(status_code=400, detail="Device ID already exists")
+            if security_manager.verify_hardware_key(hardware_key, existing_device.hardware_key):
+                # 已审批设备再次注册时，同步最新 IP 和城市，便于上位机查看在线位置。
+                existing_device.device_ip = device_ip or existing_device.device_ip
+                existing_device.location = location or existing_device.location or infer_location(device_id)
+                existing_device.updated_at = datetime.now()
+                db.commit()
+                logger.info(f"设备已审批，可直接连接服务器: {device_id}")
+                return {
+                    "status": "approved",
+                    "message": "Device already approved, you can connect to server directly",
+                    "device_id": device_id
+                }
+            raise HTTPException(status_code=400, detail="Device ID already exists with another hardware key")
 
-        # 创建新设备
-        new_device = Device(
+        # 若已有待审批申请，则只更新申请信息，避免同一设备重复堆积多条 pending。
+        pending_request = db.query(DeviceRegistrationRequest).filter(
+            DeviceRegistrationRequest.device_id == device_id,
+            DeviceRegistrationRequest.hardware_key == hardware_key,
+            DeviceRegistrationRequest.status == "pending"
+        ).first()
+
+        if pending_request:
+            pending_request.device_name = device_name
+            pending_request.device_ip = device_ip
+            pending_request.location = location or pending_request.location or infer_location(device_id)
+            pending_request.requested_at = datetime.now()
+            db.commit()
+            db.refresh(pending_request)
+            request_record = pending_request
+        else:
+            request_record = DeviceRegistrationRequest(
+                device_id=device_id,
+                device_name=device_name,
+                device_ip=device_ip,
+                location=location or infer_location(device_id),
+                hardware_key=hardware_key,
+                status="pending"
+            )
+            db.add(request_record)
+            db.commit()
+            db.refresh(request_record)
+
+        db.add(Notification(
             device_id=device_id,
-            device_name=device_name,
-            device_ip=device_ip,
-            hardware_key=hardware_key,
-            status="online"
-        )
-
-        db.add(new_device)
+            notification_type="device_register_request",
+            message=f"设备注册申请: {device_id} - {device_name} - {location or infer_location(device_id)}",
+            status="unread"
+        ))
         db.commit()
-        db.refresh(new_device)
 
-        logger.info(f"三相表设备注册成功: {device_id} - {device_name}")
+        # 上位机通过同一条 HTTP 长轮询通道收到新的注册审批事项。
+        remember_polling_notification({
+            "type": "device_register_request",
+            "device_id": device_id,
+            "file_name": device_name,
+            "file_size": 0,
+            "data_type": "设备管理",
+            "request_id": request_record.id,
+            "timestamp": datetime.now().isoformat()
+        })
 
+        logger.info(f"设备注册申请已提交，等待审批: {device_id}")
         return {
-            "status": "success",
-            "message": "Device registered successfully",
-            "device_id": device_id
+            "status": "pending",
+            "message": "Registration request submitted, waiting for approval",
+            "request_id": request_record.id,
+            "device_id": device_id,
+            "location": request_record.location
         }
 
     except HTTPException:
@@ -153,12 +153,12 @@ async def register_device(
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/api/device/authenticate")
 async def authenticate_device(
         device_id: str = Form(...),
         hardware_key: str = Form(...),
         device_ip: str = Form(None),
+        location: str = Form(None),
         db: Session = Depends(get_db)
 ):
     """设备认证"""
@@ -174,9 +174,10 @@ async def authenticate_device(
             logger.warning(f"设备认证失败: 硬件密钥错误 - {device_id}")
             raise HTTPException(status_code=401, detail="Invalid hardware key")
 
-        # 更新设备状态
+        # 认证成功后更新在线状态、IP 和城市，城市为空时沿用旧值或按设备号兜底推断。
         device.status = "online"
         device.device_ip = device_ip
+        device.location = location or device.location or infer_location(device_id)
         device.updated_at = datetime.now()
         db.commit()
 
@@ -186,7 +187,8 @@ async def authenticate_device(
             "status": "success",
             "message": "Authentication successful",
             "device_id": device_id,
-            "device_name": device.device_name
+            "device_name": device.device_name,
+            "location": device.location
         }
 
     except HTTPException:
@@ -207,6 +209,8 @@ async def upload_file(
         meter_model: str = Form(None),
         meter_sn: str = Form(None),
         image_type: str = Form(None),
+        location: str = Form(None),
+        has_fault: Optional[bool] = Form(None),
         file: UploadFile = File(...),
         db: Session = Depends(get_db)
 ):
@@ -234,6 +238,8 @@ async def upload_file(
                 meter_model=meter_model,
                 meter_sn=meter_sn,
                 file=file,
+                location=location,
+                has_fault=has_fault,
                 db=db
             )
 
@@ -247,6 +253,8 @@ async def upload_file(
                 description=description,
                 image_type=image_type,
                 file=file,
+                location=location,
+                has_fault=has_fault,
                 db=db
             )
 
@@ -264,10 +272,10 @@ async def upload_file(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==================== WebSocket 通知函数 ====================
+# ==================== HTTP长轮询通知函数 ====================
 
-async def send_ws_notification(notification_type: str, device_id: str, file_info: dict):
-    """发送 WebSocket 通知"""
+async def send_polling_notification(notification_type: str, device_id: str, file_info: dict):
+    """写入HTTP长轮询通知队列，供上位机通过 /api/polling/notifications 拉取。"""
     try:
         payload = {
             "type": notification_type,
@@ -283,11 +291,12 @@ async def send_ws_notification(notification_type: str, device_id: str, file_info
         if notification_type == "image_upload":
             payload["original_size"] = file_info.get("original_size")
             payload["compression_ratio"] = file_info.get("compression_ratio")
-        
-        await ws_manager.broadcast_notification(payload)
-        logger.info(f"WebSocket 通知已发送: {notification_type} - {device_id} - {file_info.get('file_name')}")
+
+        # 服务器环境不支持WebSocket，所有实时事件统一进入HTTP长轮询队列。
+        remember_polling_notification(payload)
+        logger.info(f"HTTP长轮询通知已写入: {notification_type} - {device_id} - {file_info.get('file_name')}")
     except Exception as e:
-        logger.error(f"Failed to send WebSocket notification: {e}")
+        logger.error(f"Failed to create polling notification: {e}")
 
 
 # ==================== 电量数据接口 ====================
@@ -301,53 +310,55 @@ async def upload_excel_data(
         meter_model: str,
         meter_sn: str,
         file: UploadFile,
+        location: str,
+        has_fault: Optional[bool],
         db: Session
 ):
-    """上传电量数据（Excel）- 内部处理函数"""
+    """上传电量数据（Excel）- 文件先落盘，再由服务端后台线程解析。"""
     try:
-        # 验证设备
         device = db.query(Device).filter(Device.device_id == device_id).first()
         if not device or not security_manager.verify_hardware_key(hardware_key, device.hardware_key):
             raise HTTPException(status_code=401, detail="Authentication failed")
 
-        # 检查文件扩展名
         file_ext = Path(file.filename).suffix.lower()
         if file_ext not in ['.xlsx', '.xls']:
             raise HTTPException(status_code=400, detail=f"File type not allowed: {file_ext}")
 
-        # 创建设备专属目录
         device_dir = config.upload_dir / device_id / "excel"
         device_dir.mkdir(parents=True, exist_ok=True)
 
-        # 生成文件路径
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{timestamp}_{file.filename}"
         file_path = device_dir / filename
 
-        # 读取并保存文件
         file_content = await file.read()
         async with aiofiles.open(file_path, 'wb') as f:
             await f.write(file_content)
 
         file_size = len(file_content)
-
-        # 创建数据记录（不解析 Excel，由上位机自行解析）
+        location_value = location or device.location or infer_location(device_id)
+        if location:
+            # 数据上传也携带城市，服务器同步刷新设备当前位置，方便上位机在线页查看。
+            device.location = location_value
+            device.updated_at = datetime.now()
         excel_record = MeterExcelData(
             device_id=device_id,
             file_name=filename,
             file_path=str(file_path),
             file_size=file_size,
-            description=description or f"电量数据 - {timestamp}"
+            location=location_value,
+            description=description or f"电量数据 - {timestamp}",
+            processing_status="pending",
         )
 
         db.add(excel_record)
         db.commit()
         db.refresh(excel_record)
 
-        # 更新统计
         update_statistics(db, device_id, "excel", file_size)
+        detected_fault, fault_summary = detect_fault_flag(filename, description, has_fault)
+        create_search_index(db, "excel", excel_record, location_value, detected_fault, fault_summary)
 
-        # 创建数据库通知记录
         notification = Notification(
             device_id=device_id,
             notification_type="excel_upload",
@@ -357,30 +368,31 @@ async def upload_excel_data(
         db.add(notification)
         db.commit()
 
-        # 后台任务：通过 WebSocket 通知上位机
         file_info = {
-            "file_id": excel_record.id,  # 添加 file_id
+            "file_id": excel_record.id,
             "file_name": filename,
             "file_size": file_size,
-            "data_type": "电量数据"
+            "data_type": "电量数据",
+            "processing_status": "pending",
         }
-        background_tasks.add_task(send_ws_notification, "excel_upload", device_id, file_info)
+        background_tasks.add_task(send_polling_notification, "excel_upload", device_id, file_info)
 
-        logger.info(f"电量数据上传成功: {device_id}/{filename} ({file_size} bytes)")
-
+        logger.info(f"电量数据上传成功: {device_id}/{filename} ({file_size} bytes)，等待服务端后台解析")
         return {
             "status": "success",
             "message": "Excel data uploaded successfully",
             "data_type": "excel",
             "file_id": excel_record.id,
             "file_name": filename,
-            "file_size": file_size
+            "file_size": file_size,
+            "processing_status": "pending",
         }
-
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Excel upload failed: {e}")
+        db.rollback()
+        create_upload_error_notification(db, device_id, "excel", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -393,6 +405,8 @@ async def upload_excel_endpoint(
         meter_model: str = Form(None),
         meter_sn: str = Form(None),
         file: UploadFile = File(...),
+        location: str = Form(None),
+        has_fault: Optional[bool] = Form(None),
         db: Session = Depends(get_db)
 ):
     """上传电量数据（Excel）- 直接调用接口"""
@@ -404,6 +418,8 @@ async def upload_excel_endpoint(
         meter_model=meter_model,
         meter_sn=meter_sn,
         file=file,
+        location=location,
+        has_fault=has_fault,
         db=db
     )
 
@@ -417,34 +433,29 @@ async def upload_image_data(
         description: str,
         image_type: str,
         file: UploadFile,
+        location: str,
+        has_fault: Optional[bool],
         db: Session
 ):
-    """上传几何量数据（图片）- 内部处理函数"""
+    """上传几何量数据（图片）- 文件先落盘，再由服务端后台线程分析。"""
     try:
-        # 验证设备
         device = db.query(Device).filter(Device.device_id == device_id).first()
         if not device or not security_manager.verify_hardware_key(hardware_key, device.hardware_key):
             raise HTTPException(status_code=401, detail="Authentication failed")
 
-        # 检查文件扩展名
         file_ext = Path(file.filename).suffix.lower()
         if file_ext not in ['.jpg', '.jpeg', '.png', '.bmp']:
             raise HTTPException(status_code=400, detail=f"File type not allowed: {file_ext}")
 
-        # 创建设备专属目录
         device_dir = config.upload_dir / device_id / "image"
         device_dir.mkdir(parents=True, exist_ok=True)
 
-        # 生成文件路径
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{timestamp}_{file.filename}"
         file_path = device_dir / filename
 
-        # 读取文件内容
         file_content = await file.read()
         original_size = len(file_content)
-
-        # 图片压缩
         if config.image_compression_enabled:
             logger.info(f"Compressing image: {filename}")
             file_content = image_compressor.compress_image(
@@ -453,37 +464,40 @@ async def upload_image_data(
                 max_size=config.image_max_size
             )
 
-        # 保存文件
         async with aiofiles.open(file_path, 'wb') as f:
             await f.write(file_content)
 
         compressed_size = len(file_content)
         compression_ratio = ((original_size - compressed_size) / original_size * 100) if original_size > 0 else 0
-
-        # 图片类型分类
         if not image_type:
             image_type = meter_image_classifier.classify_image(filename)
 
-        # 创建数据记录
+        location_value = location or device.location or infer_location(device_id)
+        if location:
+            # 图片上传携带的城市和文件记录一起保存，并回写设备当前城市。
+            device.location = location_value
+            device.updated_at = datetime.now()
         image_record = MeterImageData(
             device_id=device_id,
             file_name=filename,
             file_path=str(file_path),
             file_size=compressed_size,
             original_size=original_size,
+            location=location_value,
             description=description or f"几何量数据 - {timestamp}",
             image_type=image_type,
-            compression_ratio=compression_ratio
+            compression_ratio=compression_ratio,
+            processing_status="pending",
         )
 
         db.add(image_record)
         db.commit()
         db.refresh(image_record)
 
-        # 更新统计
         update_statistics(db, device_id, "image", compressed_size, original_size)
+        detected_fault, fault_summary = detect_fault_flag(filename, description, has_fault)
+        create_search_index(db, "image", image_record, location_value, detected_fault, fault_summary)
 
-        # 创建数据库通知记录
         notification = Notification(
             device_id=device_id,
             notification_type="image_upload",
@@ -493,20 +507,20 @@ async def upload_image_data(
         db.add(notification)
         db.commit()
 
-        # 后台任务：通过 WebSocket 通知上位机
         file_info = {
-            "file_id": image_record.id,  # 添加 file_id
+            "file_id": image_record.id,
             "file_name": filename,
             "file_size": compressed_size,
             "original_size": original_size,
             "compression_ratio": compression_ratio,
-            "data_type": "几何量数据"
+            "data_type": "几何量数据",
+            "processing_status": "pending",
         }
-        background_tasks.add_task(send_ws_notification, "image_upload", device_id, file_info)
+        background_tasks.add_task(send_polling_notification, "image_upload", device_id, file_info)
 
         logger.info(
             f"几何量数据上传成功: {device_id}/{filename} "
-            f"({original_size} -> {compressed_size} bytes, 压缩率: {compression_ratio:.1f}%)"
+            f"({original_size} -> {compressed_size} bytes, 压缩率: {compression_ratio:.1f}%)，等待服务端后台分析"
         )
 
         return {
@@ -518,13 +532,15 @@ async def upload_image_data(
             "original_size": original_size,
             "compressed_size": compressed_size,
             "compression_ratio": compression_ratio,
-            "image_type": image_type
+            "image_type": image_type,
+            "processing_status": "pending",
         }
-
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Image upload failed: {e}")
+        db.rollback()
+        create_upload_error_notification(db, device_id, "image", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -536,6 +552,8 @@ async def upload_image_endpoint(
         description: str = Form(None),
         image_type: str = Form(None),
         file: UploadFile = File(...),
+        location: str = Form(None),
+        has_fault: Optional[bool] = Form(None),
         db: Session = Depends(get_db)
 ):
     """上传几何量数据（图片）- 直接调用接口"""
@@ -546,6 +564,8 @@ async def upload_image_endpoint(
         description=description,
         image_type=image_type,
         file=file,
+        location=location,
+        has_fault=has_fault,
         db=db
     )
 
@@ -559,32 +579,18 @@ async def get_excel_data(
         skip: int = 0,
         db: Session = Depends(get_db)
 ):
-    """获取电量数据列表"""
+    """获取电量数据列表。"""
     try:
         query = db.query(MeterExcelData)
-
         if device_id:
             query = query.filter(MeterExcelData.device_id == device_id)
-
         total = query.count()
         files = query.order_by(desc(MeterExcelData.upload_time)).limit(limit).offset(skip).all()
-
         return {
             "status": "success",
             "total": total,
             "count": len(files),
-            "data": [
-                {
-                    "id": f.id,
-                    "device_id": f.device_id,
-                    "file_name": f.file_name,
-                    "file_path": f.file_path,
-                    "file_size": f.file_size,
-                    "upload_time": f.upload_time.isoformat(),
-                    "description": f.description
-                }
-                for f in files
-            ]
+            "data": [serialize_excel_record(db, file_record, include_parsed_data=False) for file_record in files],
         }
     except Exception as e:
         logger.error(f"Failed to get excel data: {e}")
@@ -598,35 +604,18 @@ async def get_image_data(
         skip: int = 0,
         db: Session = Depends(get_db)
 ):
-    """获取几何量数据列表"""
+    """获取几何量数据列表。"""
     try:
         query = db.query(MeterImageData)
-
         if device_id:
             query = query.filter(MeterImageData.device_id == device_id)
-
         total = query.count()
         files = query.order_by(desc(MeterImageData.upload_time)).limit(limit).offset(skip).all()
-
         return {
             "status": "success",
             "total": total,
             "count": len(files),
-            "data": [
-                {
-                    "id": f.id,
-                    "device_id": f.device_id,
-                    "file_name": f.file_name,
-                    "file_path": f.file_path,
-                    "file_size": f.file_size,
-                    "original_size": f.original_size,
-                    "compression_ratio": f.compression_ratio,
-                    "upload_time": f.upload_time.isoformat(),
-                    "description": f.description,
-                    "image_type": f.image_type
-                }
-                for f in files
-            ]
+            "data": [serialize_image_record(db, file_record, include_analysis_data=False) for file_record in files],
         }
     except Exception as e:
         logger.error(f"Failed to get image data: {e}")
@@ -640,15 +629,13 @@ async def get_all_data(
         skip: int = 0,
         db: Session = Depends(get_db)
 ):
-    """获取所有数据（电量和几何量）"""
+    """获取所有数据（电量和几何量）。"""
     try:
-        # 获取电量数据
         excel_query = db.query(MeterExcelData)
         if device_id:
             excel_query = excel_query.filter(MeterExcelData.device_id == device_id)
         excel_files = excel_query.order_by(desc(MeterExcelData.upload_time)).limit(limit).offset(skip).all()
 
-        # 获取几何量数据
         image_query = db.query(MeterImageData)
         if device_id:
             image_query = image_query.filter(MeterImageData.device_id == device_id)
@@ -658,34 +645,11 @@ async def get_all_data(
             "status": "success",
             "excel_data": {
                 "count": len(excel_files),
-                "data": [
-                    {
-                        "id": f.id,
-                        "device_id": f.device_id,
-                        "file_name": f.file_name,
-                        "file_size": f.file_size,
-                        "upload_time": f.upload_time.isoformat(),
-                        "description": f.description,
-                        "data_type": "excel"
-                    }
-                    for f in excel_files
-                ]
+                "data": [dict(serialize_excel_record(db, file_record, include_parsed_data=False), data_type="excel") for file_record in excel_files]
             },
             "image_data": {
                 "count": len(image_files),
-                "data": [
-                    {
-                        "id": f.id,
-                        "device_id": f.device_id,
-                        "file_name": f.file_name,
-                        "file_size": f.file_size,
-                        "original_size": f.original_size,
-                        "upload_time": f.upload_time.isoformat(),
-                        "description": f.description,
-                        "data_type": "image"
-                    }
-                    for f in image_files
-                ]
+                "data": [dict(serialize_image_record(db, file_record, include_analysis_data=False), data_type="image") for file_record in image_files]
             }
         }
     except Exception as e:
@@ -695,25 +659,12 @@ async def get_all_data(
 
 @app.get("/api/data/excel/{file_id}")
 async def get_excel_detail(file_id: int, db: Session = Depends(get_db)):
-    """获取电量数据详情"""
+    """获取电量数据详情。"""
     try:
         file_record = db.query(MeterExcelData).filter(MeterExcelData.id == file_id).first()
-
         if not file_record:
             raise HTTPException(status_code=404, detail="File not found")
-
-        return {
-            "status": "success",
-            "data": {
-                "id": file_record.id,
-                "device_id": file_record.device_id,
-                "file_name": file_record.file_name,
-                "file_path": file_record.file_path,
-                "file_size": file_record.file_size,
-                "upload_time": file_record.upload_time.isoformat(),
-                "description": file_record.description
-            }
-        }
+        return {"status": "success", "data": serialize_excel_record(db, file_record, include_parsed_data=True)}
     except HTTPException:
         raise
     except Exception as e:
@@ -723,28 +674,12 @@ async def get_excel_detail(file_id: int, db: Session = Depends(get_db)):
 
 @app.get("/api/data/image/{file_id}")
 async def get_image_detail(file_id: int, db: Session = Depends(get_db)):
-    """获取几何量数据详情"""
+    """获取几何量数据详情。"""
     try:
         file_record = db.query(MeterImageData).filter(MeterImageData.id == file_id).first()
-
         if not file_record:
             raise HTTPException(status_code=404, detail="File not found")
-
-        return {
-            "status": "success",
-            "data": {
-                "id": file_record.id,
-                "device_id": file_record.device_id,
-                "file_name": file_record.file_name,
-                "file_path": file_record.file_path,
-                "file_size": file_record.file_size,
-                "original_size": file_record.original_size,
-                "compression_ratio": file_record.compression_ratio,
-                "upload_time": file_record.upload_time.isoformat(),
-                "description": file_record.description,
-                "image_type": file_record.image_type
-            }
-        }
+        return {"status": "success", "data": serialize_image_record(db, file_record, include_analysis_data=True)}
     except HTTPException:
         raise
     except Exception as e:
@@ -803,6 +738,55 @@ async def download_image_file(file_id: int, db: Session = Depends(get_db)):
 
 
 # ==================== 通知接口 ====================
+
+
+@app.get("/api/notifications")
+async def list_notifications(
+        notification_type: str = None,
+        device_id: str = None,
+        status: str = None,
+        keyword: str = None,
+        limit: int = 100,
+        skip: int = 0,
+        db: Session = Depends(get_db)
+):
+    """查询通知历史，支持按类型、设备、状态和关键词过滤。"""
+    try:
+        query = db.query(Notification)
+
+        if notification_type:
+            query = query.filter(Notification.notification_type == notification_type)
+        if device_id:
+            query = query.filter(Notification.device_id == device_id)
+        if status:
+            query = query.filter(Notification.status == status)
+        if keyword:
+            query = query.filter(Notification.message.like(f"%{keyword}%"))
+
+        total = query.count()
+        notifications = query.order_by(desc(Notification.created_at)).limit(limit).offset(skip).all()
+
+        return {
+            "status": "success",
+            "total": total,
+            "count": len(notifications),
+            "notifications": [
+                {
+                    "id": n.id,
+                    "device_id": n.device_id,
+                    "notification_type": n.notification_type,
+                    "message": n.message,
+                    "status": n.status,
+                    "created_at": n.created_at.isoformat() if n.created_at else None,
+                    "read_at": n.read_at.isoformat() if n.read_at else None,
+                }
+                for n in notifications
+            ]
+        }
+    except Exception as e:
+        logger.error(f"Failed to list notifications: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/notifications/unread")
 async def get_unread_notifications(db: Session = Depends(get_db)):
@@ -973,6 +957,7 @@ async def list_devices(db: Session = Depends(get_db)):
                     "device_id": d.device_id,
                     "device_name": d.device_name,
                     "device_ip": d.device_ip,
+                    "location": d.location,
                     "status": d.status,
 
                     "created_at": d.created_at.isoformat(),
@@ -1002,7 +987,7 @@ async def health_check():
 
 def update_statistics(db: Session, device_id: str, data_type: str,
                       file_size: int, original_size: int = None):
-    """更新统计信息"""
+    """Update daily upload statistics and tolerate legacy NULL values."""
     try:
         today = datetime.now().date()
         stat = db.query(DataStatistics).filter(
@@ -1012,22 +997,41 @@ def update_statistics(db: Session, device_id: str, data_type: str,
         ).first()
 
         if not stat:
-            stat = DataStatistics(device_id=device_id)
+            stat = DataStatistics(
+                device_id=device_id,
+                date=datetime.now(),
+                excel_count=0,
+                excel_total_size=0,
+                image_count=0,
+                image_total_size=0,
+                image_original_size=0,
+            )
             db.add(stat)
+
+        # Legacy rows can contain NULL values; normalize before arithmetic.
+        stat.excel_count = stat.excel_count or 0
+        stat.excel_total_size = stat.excel_total_size or 0
+        stat.image_count = stat.image_count or 0
+        stat.image_total_size = stat.image_total_size or 0
+        stat.image_original_size = stat.image_original_size or 0
+
+        safe_file_size = int(file_size or 0)
+        safe_original_size = int(original_size or 0)
 
         if data_type == "excel":
             stat.excel_count += 1
-            stat.excel_total_size += file_size
+            stat.excel_total_size += safe_file_size
         elif data_type == "image":
             stat.image_count += 1
-            stat.image_total_size += file_size
-            if original_size:
-                stat.image_original_size += original_size
+            stat.image_total_size += safe_file_size
+            if safe_original_size > 0:
+                stat.image_original_size += safe_original_size
 
+        stat.updated_at = datetime.now()
         db.commit()
     except Exception as e:
+        db.rollback()
         logger.error(f"Failed to update statistics: {e}")
-
 
 @app.post("/api/device/set-status")
 async def set_device_status(
