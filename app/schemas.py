@@ -106,6 +106,11 @@ class NotificationResponse(BaseModel):
     class Config:
         from_attributes = True
 
+class AdminPasswordVerify(BaseModel):
+    """上位机启动时提交的管理员密码校验请求。"""
+    password: str
+
+
 # ==================== 统计相关 ====================
 class DataStatisticsResponse(BaseModel):
     device_id: str

@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, BigInteger, Enum, Float, Boolean, inspect, text, Index
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, BigInteger, Enum, Float, Boolean, inspect, text, Index, CheckConstraint
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.mysql import LONGTEXT
@@ -338,15 +338,53 @@ class Notification(Base):
     read_at = Column(DateTime)
 
 
+class SystemAdminCredential(Base):
+    """上位机管理员唯一凭据；只允许数据库管理员直接修改 password 字段。"""
+    __tablename__ = "system_admin_credentials"
+
+    id = Column(Integer, primary_key=True, default=1)
+    singleton_key = Column(String(50), nullable=False, unique=True, default="upper_client_admin")
+    password = Column(String(255), nullable=False)
+    created_at = Column(DateTime, default=datetime.now)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_system_admin_credentials_singleton"),
+    )
+
+
 def init_db():
     """初始化数据库"""
     try:
         Base.metadata.create_all(bind=engine)
         _ensure_legacy_columns()
+        _ensure_system_admin_credential()
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
         raise
+
+
+def _ensure_system_admin_credential():
+    """仅在凭据不存在时写入默认密码，绝不覆盖数据库中的人工修改。"""
+    db = SessionLocal()
+    try:
+        credential = db.query(SystemAdminCredential).filter(
+            SystemAdminCredential.singleton_key == "upper_client_admin"
+        ).first()
+        if credential is None:
+            db.add(SystemAdminCredential(
+                id=1,
+                singleton_key="upper_client_admin",
+                password="nqisystemadmin",
+            ))
+            db.commit()
+            logger.info("Default upper-client administrator credential initialized")
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 def _ensure_legacy_columns():

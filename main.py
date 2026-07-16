@@ -10,18 +10,20 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import shutil
 import asyncio
+import secrets
 
 from app.config_ini import config
 from app.logger import logger
 from app.database import init_db, get_db, SessionLocal, Device, DeviceIdReservation, MeterExcelData, MeterImageData, Notification, DataStatistics, \
-    DataType, Hardware_Key, DeviceRegistrationRequest, FaultRecord, DataSearchIndex
+    DataType, Hardware_Key, DeviceRegistrationRequest, FaultRecord, DataSearchIndex, \
+    SystemAdminCredential
 from app.security import security_manager
 from app.utils import image_compressor
 from app.meter_utils import meter_image_classifier
 from app.schemas import (
     DeviceCreate, DeviceAuthenticate, DeviceResponse,
     MeterExcelDataResponse, MeterImageDataResponse,
-    NotificationResponse, DataStatisticsResponse
+    NotificationResponse, DataStatisticsResponse, AdminPasswordVerify
 )
 from app.feature_routes import router as feature_router
 from app.feature_services import (
@@ -58,6 +60,19 @@ async def shutdown_event():
     # 关闭服务时优雅停止后台解析线程，避免残留轮询任务。
     stop_processing_workers()
     logger.info("Server shutting down")
+
+
+@app.post("/api/admin/verify-password")
+async def verify_admin_password(payload: AdminPasswordVerify, db: Session = Depends(get_db)):
+    """校验唯一管理员密码；密码只能由数据库管理员直接修改。"""
+    credential = db.query(SystemAdminCredential).filter(
+        SystemAdminCredential.singleton_key == "upper_client_admin"
+    ).one_or_none()
+    if credential is None:
+        raise HTTPException(status_code=503, detail="管理员凭据尚未初始化")
+    if not secrets.compare_digest(payload.password, credential.password):
+        raise HTTPException(status_code=401, detail="管理员密码错误")
+    return {"valid": True}
 
 
 # ==================== 设备管理接口 ====================
