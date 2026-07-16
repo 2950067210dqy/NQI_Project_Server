@@ -6,6 +6,7 @@ from io import BytesIO
 import pandas as pd
 from sqlalchemy.orm import Session
 
+from app.alarm_message_formatter import build_rule_message
 from app.database import (
     AlarmRule,
     DataSearchIndex,
@@ -168,20 +169,14 @@ def remember_polling_notification(payload: dict):
 
 
 def ensure_default_alarm_rules(db: Session):
-    """初始化默认预警规则，保证上位机首次打开配置页时有可编辑规则。"""
-    existing_keys = {
-        (row.data_type, row.metric_key, row.rule_name)
-        for row in db.query(AlarmRule.data_type, AlarmRule.metric_key, AlarmRule.rule_name).all()
-    }
-    created = False
+    """仅在规则表为空时初始化默认预警规则，避免刷新时覆盖用户修改。"""
+    # 自带规则也是用户可编辑规则；只要表里已有规则，就不再按默认模板补回旧规则。
+    if db.query(AlarmRule.id).first() is not None:
+        return
+
     for item in DEFAULT_ALARM_RULES:
-        key = (item["data_type"], item["metric_key"], item["rule_name"])
-        if key in existing_keys:
-            continue
         db.add(AlarmRule(**item))
-        created = True
-    if created:
-        db.commit()
+    db.commit()
 
 
 def compare_value(value, operator: str, threshold) -> bool:
@@ -276,12 +271,9 @@ def evaluate_alarm_rules(db: Session, data_type: str, metrics: dict) -> tuple[li
         if rule.operator != "enabled" and rule.threshold_value is None:
             continue
         if compare_value(metric_value, rule.operator, rule.threshold_value):
-            if rule.operator == "enabled":
-                messages.append(f"{rule.rule_name}: {metric_value}")
-            else:
-                messages.append(
-                    f"{rule.rule_name}: {rule.metric_key}={metric_value} {rule.operator} {rule.threshold_value}"
-                )
+            messages.append(
+                build_rule_message(rule.rule_name, rule.metric_key, metric_value, rule.operator, rule.threshold_value)
+            )
             severity = pick_higher_severity(severity, rule.severity or "warning")
     return messages, severity
 
@@ -452,12 +444,18 @@ def create_alarm_notification(
         db: Session,
         device_id: str,
         message: str,
-        notification_type: str = "fault_alarm"
+        notification_type: str = "fault_alarm",
+        data_type: str = None,
+        file_id: int = None,
+        file_name: str = None,
 ):
-    """Persist warning/alarm notifications so server-side history is queryable."""
+    """持久化预警通知，并保存可查看、可下载的原始文件关联。"""
     notification = Notification(
         device_id=device_id,
         notification_type=notification_type,
+        data_type=data_type,
+        file_id=file_id,
+        file_name=file_name,
         message=message,
         status="unread"
     )
@@ -475,7 +473,8 @@ def create_upload_error_notification(db: Session, device_id: str, data_type: str
         db=db,
         device_id=device_id,
         message=f"{data_type} 数据上传错误: {message}",
-        notification_type="fault_alarm"
+        notification_type="fault_alarm",
+        data_type=data_type,
     )
     remember_polling_notification({
         "type": "fault_alarm",

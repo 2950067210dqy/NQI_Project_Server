@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 from sqlalchemy import desc, func
+from sqlalchemy.exc import IntegrityError
 from typing import Optional, List
 import aiofiles
 from pathlib import Path
@@ -12,7 +13,7 @@ import asyncio
 
 from app.config_ini import config
 from app.logger import logger
-from app.database import init_db, get_db, SessionLocal, Device, MeterExcelData, MeterImageData, Notification, DataStatistics, \
+from app.database import init_db, get_db, SessionLocal, Device, DeviceIdReservation, MeterExcelData, MeterImageData, Notification, DataStatistics, \
     DataType, Hardware_Key, DeviceRegistrationRequest, FaultRecord, DataSearchIndex
 from app.security import security_manager
 from app.utils import image_compressor
@@ -71,13 +72,22 @@ async def register_device(
 
         db: Session = Depends(get_db)
 ):
-    """提交设备注册申请；只有审批通过后设备才可认证连接。"""
+    """提交设备注册申请；同一设备 ID 只能由一个硬件占用。"""
     try:
-        # 已经通过审批并落库的设备，重复注册时直接返回已审批状态。
-        existing_device = db.query(Device).filter(Device.device_id == device_id).first()
+        device_id = device_id.strip()
+        hardware_key = hardware_key.strip()
+        if not device_id:
+            raise HTTPException(status_code=400, detail="设备ID不能为空")
+        if not hardware_key:
+            raise HTTPException(status_code=400, detail="硬件密钥不能为空")
+        device_id_key = device_id.casefold()
+
+        # 正式设备表已有唯一约束；同一 ID 的原硬件可重连，其他硬件必须更换 ID。
+        existing_device = db.query(Device).filter(
+            func.lower(Device.device_id) == device_id_key
+        ).with_for_update().first()
         if existing_device:
             if security_manager.verify_hardware_key(hardware_key, existing_device.hardware_key):
-                # 已审批设备再次注册时，同步最新 IP 和城市，便于上位机查看在线位置。
                 existing_device.device_ip = device_ip or existing_device.device_ip
                 existing_device.location = location or existing_device.location or infer_location(device_id)
                 existing_device.updated_at = datetime.now()
@@ -85,25 +95,55 @@ async def register_device(
                 logger.info(f"设备已审批，可直接连接服务器: {device_id}")
                 return {
                     "status": "approved",
-                    "message": "Device already approved, you can connect to server directly",
-                    "device_id": device_id
+                    "message": "设备已经审批通过，可以直接连接服务器",
+                    "device_id": existing_device.device_id,
                 }
-            raise HTTPException(status_code=400, detail="Device ID already exists with another hardware key")
+            raise HTTPException(
+                status_code=409,
+                detail=f"设备ID {device_id} 已被其他设备使用，请更换设备ID",
+            )
 
-        # 若已有待审批申请，则只更新申请信息，避免同一设备重复堆积多条 pending。
+        # 兼容升级前的待审批数据；已有申请时只允许相同硬件更新。
         pending_request = db.query(DeviceRegistrationRequest).filter(
-            DeviceRegistrationRequest.device_id == device_id,
-            DeviceRegistrationRequest.hardware_key == hardware_key,
-            DeviceRegistrationRequest.status == "pending"
-        ).first()
+            func.lower(DeviceRegistrationRequest.device_id) == device_id_key,
+            DeviceRegistrationRequest.status == "pending",
+        ).order_by(DeviceRegistrationRequest.id.asc()).with_for_update().first()
+        if pending_request and pending_request.hardware_key != hardware_key:
+            raise HTTPException(
+                status_code=409,
+                detail=f"设备ID {device_id} 已有待审批申请，请更换设备ID",
+            )
+
+        # device_id_reservations 以规范化 ID 为主键，从数据库层阻止并发重复注册。
+        reservation = db.query(DeviceIdReservation).filter(
+            DeviceIdReservation.device_id == device_id_key
+        ).with_for_update().first()
+        if reservation and reservation.hardware_key != hardware_key:
+            raise HTTPException(
+                status_code=409,
+                detail=f"设备ID {device_id} 已被占用，请更换设备ID",
+            )
+        if not reservation:
+            reservation = DeviceIdReservation(
+                device_id=device_id_key,
+                hardware_key=hardware_key,
+                status="pending",
+            )
+            db.add(reservation)
+            try:
+                db.flush()
+            except IntegrityError:
+                db.rollback()
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"设备ID {device_id} 已被其他设备抢先占用，请更换设备ID",
+                )
 
         if pending_request:
             pending_request.device_name = device_name
             pending_request.device_ip = device_ip
             pending_request.location = location or pending_request.location or infer_location(device_id)
             pending_request.requested_at = datetime.now()
-            db.commit()
-            db.refresh(pending_request)
             request_record = pending_request
         else:
             request_record = DeviceRegistrationRequest(
@@ -112,19 +152,23 @@ async def register_device(
                 device_ip=device_ip,
                 location=location or infer_location(device_id),
                 hardware_key=hardware_key,
-                status="pending"
+                status="pending",
             )
             db.add(request_record)
-            db.commit()
-            db.refresh(request_record)
+            db.flush()
+
+        reservation.request_id = request_record.id
+        reservation.status = "pending"
+        reservation.updated_at = datetime.now()
 
         db.add(Notification(
             device_id=device_id,
             notification_type="device_register_request",
             message=f"设备注册申请: {device_id} - {device_name} - {location or infer_location(device_id)}",
-            status="unread"
+            status="unread",
         ))
         db.commit()
+        db.refresh(request_record)
 
         # 上位机通过同一条 HTTP 长轮询通道收到新的注册审批事项。
         remember_polling_notification({
@@ -134,24 +178,26 @@ async def register_device(
             "file_size": 0,
             "data_type": "设备管理",
             "request_id": request_record.id,
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now().isoformat(),
         })
 
         logger.info(f"设备注册申请已提交，等待审批: {device_id}")
         return {
             "status": "pending",
-            "message": "Registration request submitted, waiting for approval",
+            "message": "注册申请已提交，正在等待审批",
             "request_id": request_record.id,
             "device_id": device_id,
-            "location": request_record.location
+            "location": request_record.location,
         }
 
     except HTTPException:
+        db.rollback()
         raise
     except Exception as e:
         logger.error(f"Device registration failed: {e}")
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.post("/api/device/authenticate")
 async def authenticate_device(
@@ -740,6 +786,59 @@ async def download_image_file(file_id: int, db: Session = Depends(get_db)):
 # ==================== 通知接口 ====================
 
 
+def _notification_file_context(notification: Notification, db: Session) -> dict:
+    """返回通知关联文件；旧通知按消息中的文件名兼容解析。"""
+    data_type = notification.data_type
+    file_id = notification.file_id
+    file_name = notification.file_name
+    if data_type in {"excel", "image"} and file_id:
+        return {"data_type": data_type, "file_id": file_id, "file_name": file_name}
+
+    message = str(notification.message or "")
+    prefix_models = (
+        ("电量数据预警:", "excel", MeterExcelData),
+        ("几何量数据预警:", "image", MeterImageData),
+    )
+    for prefix, inferred_type, model in prefix_models:
+        if prefix not in message:
+            continue
+        inferred_name = message.split(prefix, 1)[1].split(" - ", 1)[0].strip()
+        if not inferred_name:
+            break
+        record = db.query(model).filter(
+            model.device_id == notification.device_id,
+            model.file_name == inferred_name,
+        ).order_by(model.id.desc()).first()
+        if record:
+            return {
+                "data_type": inferred_type,
+                "file_id": record.id,
+                "file_name": record.file_name,
+            }
+        break
+    return {"data_type": data_type, "file_id": file_id, "file_name": file_name}
+
+
+def _serialize_notification(notification: Notification, db: Session) -> dict:
+    """统一序列化通知，并附带上位机查看、下载需要的字段。"""
+    context = _notification_file_context(notification, db)
+    data_type = context.get("data_type")
+    file_id = context.get("file_id")
+    return {
+        "id": notification.id,
+        "device_id": notification.device_id,
+        "notification_type": notification.notification_type,
+        "data_type": data_type,
+        "file_id": file_id,
+        "file_name": context.get("file_name"),
+        "download_url": f"/api/file/download/{data_type}/{file_id}" if data_type and file_id else None,
+        "message": notification.message,
+        "status": notification.status,
+        "created_at": notification.created_at.isoformat() if notification.created_at else None,
+        "read_at": notification.read_at.isoformat() if notification.read_at else None,
+    }
+
+
 @app.get("/api/notifications")
 async def list_notifications(
         notification_type: str = None,
@@ -770,18 +869,7 @@ async def list_notifications(
             "status": "success",
             "total": total,
             "count": len(notifications),
-            "notifications": [
-                {
-                    "id": n.id,
-                    "device_id": n.device_id,
-                    "notification_type": n.notification_type,
-                    "message": n.message,
-                    "status": n.status,
-                    "created_at": n.created_at.isoformat() if n.created_at else None,
-                    "read_at": n.read_at.isoformat() if n.read_at else None,
-                }
-                for n in notifications
-            ]
+            "notifications": [_serialize_notification(n, db) for n in notifications]
         }
     except Exception as e:
         logger.error(f"Failed to list notifications: {e}")
@@ -799,16 +887,7 @@ async def get_unread_notifications(db: Session = Depends(get_db)):
         return {
             "status": "success",
             "count": len(notifications),
-            "notifications": [
-                {
-                    "id": n.id,
-                    "device_id": n.device_id,
-                    "notification_type": n.notification_type,
-                    "message": n.message,
-                    "created_at": n.created_at.isoformat()
-                }
-                for n in notifications
-            ]
+            "notifications": [_serialize_notification(n, db) for n in notifications]
         }
     except Exception as e:
         logger.error(f"Failed to get notifications: {e}")
@@ -945,8 +1024,22 @@ async def get_system_overview(db: Session = Depends(get_db)):
 
 @app.get("/api/devices/list")
 async def list_devices(db: Session = Depends(get_db)):
-    """获取设备列表"""
+    """获取设备列表；按最后心跳时间自动把超时设备置为离线。"""
     try:
+        heartbeat_timeout_seconds = 20
+        stale_cutoff = datetime.now() - timedelta(seconds=heartbeat_timeout_seconds)
+        stale_devices = db.query(Device).filter(
+            Device.status == "online",
+            Device.updated_at.isnot(None),
+            Device.updated_at < stale_cutoff,
+        ).all()
+        for device in stale_devices:
+            # 自动离线只改状态，保留 updated_at 作为最后一次真实心跳时间。
+            device.status = "offline"
+        if stale_devices:
+            db.commit()
+            logger.info(f"自动标记离线设备 {len(stale_devices)} 台，心跳超时 {heartbeat_timeout_seconds}s")
+
         devices = db.query(Device).all()
 
         return {

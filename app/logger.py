@@ -21,8 +21,8 @@ def setup_logger():
     # 添加文件输出
     logger.add(
         config.log_dir / "server_{time:YYYY-MM-DD}.log",
-        rotation=config.config.get('logging', 'log_rotation'),
-        retention=config.config.get('logging', 'log_retention'),
+        rotation=config.config.get('logging', 'log_rotation', fallback='10 MB'),
+        retention=config.config.get('logging', 'log_retention', fallback='30 days'),
         format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
         level=config.log_level,
         encoding='utf-8'
