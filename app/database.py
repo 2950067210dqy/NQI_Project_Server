@@ -109,6 +109,11 @@ class MeterExcelData(Base):
     processing_status = Column(String(20), default="pending", index=True)  # pending/processing/done/failed
     processing_error = Column(Text)
     processed_at = Column(DateTime)
+    # 纳秒时间戳跨进程持久化，避免数据库 DATETIME 精度影响毫秒级报警延迟统计。
+    alarm_clock_started_ns = Column(BigInteger)
+    alarm_clock_finished_ns = Column(BigInteger)
+    alarm_latency_ms = Column(Float)
+    alarm_triggered = Column(Boolean, default=False)
 
 
 # ==================== 几何量数据表 ====================
@@ -131,6 +136,10 @@ class MeterImageData(Base):
     processing_status = Column(String(20), default="pending", index=True)  # pending/processing/done/failed
     processing_error = Column(Text)
     processed_at = Column(DateTime)
+    alarm_clock_started_ns = Column(BigInteger)
+    alarm_clock_finished_ns = Column(BigInteger)
+    alarm_latency_ms = Column(Float)
+    alarm_triggered = Column(Boolean, default=False)
 
 
 class MeterExcelParseResult(Base):
@@ -407,6 +416,10 @@ def _ensure_legacy_columns():
             "processing_status": "ALTER TABLE meter_excel_data ADD COLUMN processing_status VARCHAR(20) DEFAULT 'pending'",
             "processing_error": "ALTER TABLE meter_excel_data ADD COLUMN processing_error TEXT NULL",
             "processed_at": "ALTER TABLE meter_excel_data ADD COLUMN processed_at DATETIME NULL",
+            "alarm_clock_started_ns": "ALTER TABLE meter_excel_data ADD COLUMN alarm_clock_started_ns BIGINT NULL",
+            "alarm_clock_finished_ns": "ALTER TABLE meter_excel_data ADD COLUMN alarm_clock_finished_ns BIGINT NULL",
+            "alarm_latency_ms": "ALTER TABLE meter_excel_data ADD COLUMN alarm_latency_ms DOUBLE NULL",
+            "alarm_triggered": "ALTER TABLE meter_excel_data ADD COLUMN alarm_triggered BOOLEAN DEFAULT 0",
         },
         "meter_excel_parse_results": {
             "chart_point_count": "ALTER TABLE meter_excel_parse_results ADD COLUMN chart_point_count INT DEFAULT 0",
@@ -431,6 +444,10 @@ def _ensure_legacy_columns():
             "processing_status": "ALTER TABLE meter_image_data ADD COLUMN processing_status VARCHAR(20) DEFAULT 'pending'",
             "processing_error": "ALTER TABLE meter_image_data ADD COLUMN processing_error TEXT NULL",
             "processed_at": "ALTER TABLE meter_image_data ADD COLUMN processed_at DATETIME NULL",
+            "alarm_clock_started_ns": "ALTER TABLE meter_image_data ADD COLUMN alarm_clock_started_ns BIGINT NULL",
+            "alarm_clock_finished_ns": "ALTER TABLE meter_image_data ADD COLUMN alarm_clock_finished_ns BIGINT NULL",
+            "alarm_latency_ms": "ALTER TABLE meter_image_data ADD COLUMN alarm_latency_ms DOUBLE NULL",
+            "alarm_triggered": "ALTER TABLE meter_image_data ADD COLUMN alarm_triggered BOOLEAN DEFAULT 0",
         },
     }
 

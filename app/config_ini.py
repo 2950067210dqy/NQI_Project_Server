@@ -62,6 +62,13 @@ class Config:
                 'image_quality': '85',
                 'image_max_size': '1048576',
             },
+            'processing': {
+                'poll_interval': '0.2',
+                'supervisor_interval': '5',
+                'heartbeat_timeout': '120',
+                'error_backoff_max': '30',
+                'status_log_interval': '60',
+            },
         }
 
     def _path_from_config(self, section: str, option: str, fallback: str) -> Path:
@@ -137,6 +144,26 @@ class Config:
     @property
     def log_level(self) -> str:
         return self.config.get('logging', 'log_level', fallback='INFO')
+
+    @property
+    def processing_poll_interval(self) -> float:
+        return max(0.1, self.config.getfloat('processing', 'poll_interval', fallback=0.2))
+
+    @property
+    def processing_supervisor_interval(self) -> float:
+        return max(0.5, self.config.getfloat('processing', 'supervisor_interval', fallback=5.0))
+
+    @property
+    def processing_heartbeat_timeout(self) -> float:
+        return max(10.0, self.config.getfloat('processing', 'heartbeat_timeout', fallback=120.0))
+
+    @property
+    def processing_error_backoff_max(self) -> float:
+        return max(1.0, self.config.getfloat('processing', 'error_backoff_max', fallback=30.0))
+
+    @property
+    def processing_status_log_interval(self) -> float:
+        return max(10.0, self.config.getfloat('processing', 'status_log_interval', fallback=60.0))
 
     # 三相表配置
     @property

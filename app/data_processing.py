@@ -3,7 +3,6 @@ import math
 import random
 import re
 from pathlib import Path
-from statistics import mean
 
 import pandas as pd
 from PIL import Image, ImageFilter, ImageStat
@@ -46,13 +45,129 @@ def _parse_rated_current(raw_value) -> float:
     return current_value
 
 
+def _update_numeric_summary(summary: dict, values) -> None:
+    """用向量化结果更新聚合值，避免逐单元格创建 Python 对象。"""
+    valid_values = values[pd.notna(values)]
+    if not valid_values.size:
+        return
+    summary["count"] += int(valid_values.size)
+    summary["sum"] += float(valid_values.sum())
+    value_min = float(valid_values.min())
+    value_max = float(valid_values.max())
+    summary["min"] = value_min if summary["min"] is None else min(summary["min"], value_min)
+    summary["max"] = value_max if summary["max"] is None else max(summary["max"], value_max)
+
+
+def _summary_metrics(prefix: str, summary: dict, output: dict) -> None:
+    """将统计结果展开成预警规则可匹配的指标键。"""
+    if not summary["count"]:
+        return
+    output[f"{prefix}_max"] = summary["max"]
+    output[f"{prefix}_min"] = summary["min"]
+    output[f"{prefix}_avg"] = summary["sum"] / summary["count"]
+    output[f"{prefix}_count"] = summary["count"]
+
+
+def _scope_metric_key(value) -> str:
+    """将 Sheet 和相位名称转换为正式预警指标使用的键片段。"""
+    return str(value or "").strip().replace(" ", "_").replace("相", "") or "unknown"
+
+
+def parse_excel_alarm_metrics(file_path) -> dict:
+    """轻量解析 Excel 预警指标，不构造图表或数据库明细对象。
+
+    该函数只服务于报警延迟可视化；输出字段与正式预警保持一致，
+    但避开 parsed_data 的大量嵌套字典构造，降低 Excel 测试延迟。
+    """
+    excel_file = pd.ExcelFile(Path(file_path))
+    metrics = {"sheet_count": 0, "chart_value_count": 0, "error_value_count": 0}
+    numeric_summary = {"count": 0, "sum": 0.0, "min": None, "max": None}
+    metric_summaries = {}
+    sheet_metric_summaries = {}
+    error_summaries = {}
+    sheet_error_summaries = {}
+    sheet_phase_error_summaries = {}
+
+    def get_summary(container: dict, key):
+        return container.setdefault(key, {"count": 0, "sum": 0.0, "min": None, "max": None})
+
+    for sheet_name in excel_file.sheet_names:
+        dataframe = excel_file.parse(sheet_name, header=None)
+        data_clean = dataframe.dropna()
+        if data_clean.empty or dataframe.shape[0] < 5 or dataframe.shape[1] < 5:
+            continue
+        metrics["sheet_count"] += 1
+        numeric_frame = dataframe.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+        _update_numeric_summary(numeric_summary, numeric_frame)
+        phase_series = dataframe.iloc[3, 4:].dropna()
+        device_series = dataframe.iloc[4, 4:].drop_duplicates()
+        if len(device_series) >= 2:
+            device_series = device_series[:-2]
+        device_count = int(device_series.shape[0])
+        if not len(phase_series) or not device_count:
+            continue
+
+        for metric_group_index, metric_name in enumerate(("功率W", "电压", "电流", "相角")):
+            metric_rows = data_clean.iloc[metric_group_index * 36:(metric_group_index + 1) * 36]
+            if metric_rows.empty:
+                continue
+            metric_key = _metric_key(metric_name)
+            for phase_index, phase_column in enumerate(phase_series.index):
+                values = metric_rows.iloc[:, int(phase_column):int(phase_column) + device_count]
+                value_array = values.apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
+                valid_count = int(pd.notna(value_array).sum())
+                metrics["chart_value_count"] += valid_count
+                _update_numeric_summary(get_summary(metric_summaries, metric_key), value_array)
+                _update_numeric_summary(get_summary(sheet_metric_summaries, (str(sheet_name), metric_key)), value_array)
+                error_present_mask = None
+
+                for error_kind, error_offset in (("error_percent_abs", device_count), ("error_ppm_abs", device_count + 1)):
+                    error_column = int(phase_column) + error_offset
+                    if error_column >= metric_rows.shape[1]:
+                        continue
+                    error_values = pd.to_numeric(metric_rows.iloc[:, error_column], errors="coerce").to_numpy(dtype=float)
+                    error_values = abs(error_values)
+                    valid_error_mask = pd.notna(error_values)
+                    error_present_mask = valid_error_mask if error_present_mask is None else (error_present_mask | valid_error_mask)
+                    _update_numeric_summary(get_summary(error_summaries, (metric_key, error_kind)), error_values)
+                    _update_numeric_summary(get_summary(sheet_error_summaries, (str(sheet_name), metric_key, error_kind)), error_values)
+                    _update_numeric_summary(
+                        get_summary(sheet_phase_error_summaries, (str(sheet_name), str(phase_series.iloc[phase_index]), metric_key, error_kind)),
+                        error_values,
+                    )
+                if error_present_mask is not None:
+                    metrics["error_value_count"] += int(error_present_mask.sum())
+
+    metrics["numeric_value_count"] = numeric_summary["count"]
+    metrics["max_numeric_value"] = numeric_summary["max"] if numeric_summary["max"] is not None else 0.0
+    metrics["min_numeric_value"] = numeric_summary["min"] if numeric_summary["min"] is not None else 0.0
+    metrics["avg_numeric_value"] = numeric_summary["sum"] / numeric_summary["count"] if numeric_summary["count"] else 0.0
+    for metric_key, summary in metric_summaries.items():
+        _summary_metrics(metric_key, summary, metrics)
+    for (sheet_name, metric_key), summary in sheet_metric_summaries.items():
+        _summary_metrics(f"sheet_{_scope_metric_key(sheet_name)}_{metric_key}", summary, metrics)
+    for (metric_key, error_kind), summary in error_summaries.items():
+        _summary_metrics(f"{metric_key}_{error_kind}", summary, metrics)
+    for (sheet_name, metric_key, error_kind), summary in sheet_error_summaries.items():
+        _summary_metrics(f"sheet_{_scope_metric_key(sheet_name)}_{metric_key}_{error_kind}", summary, metrics)
+    for (sheet_name, phase_name, metric_key, error_kind), summary in sheet_phase_error_summaries.items():
+        _summary_metrics(
+            f"sheet_{_scope_metric_key(sheet_name)}_phase_{_scope_metric_key(phase_name)}_{metric_key}_{error_kind}",
+            summary,
+            metrics,
+        )
+    return metrics
+
 def parse_excel_file(file_path) -> dict:
     """解析电量 Excel，并输出上位机可直接消费的结构化结果。"""
     excel_path = Path(file_path)
     excel_file = pd.ExcelFile(excel_path)
 
     parsed_sheets = {}
-    numeric_values = []
+    numeric_value_count = 0
+    numeric_value_sum = 0.0
+    numeric_value_min = None
+    numeric_value_max = None
     device_names = set()
     phase_names = set()
 
@@ -67,8 +182,16 @@ def parse_excel_file(file_path) -> dict:
                     for device in phase.get("data", []):
                         device_names.add(str(device.get("name", "")))
         numeric_df = df.apply(pd.to_numeric, errors="coerce")
-        values = numeric_df.to_numpy().flatten()
-        numeric_values.extend(float(value) for value in values if pd.notna(value))
+        values = numeric_df.to_numpy(dtype=float)
+        valid_mask = pd.notna(values)
+        if valid_mask.any():
+            valid_values = values[valid_mask]
+            numeric_value_count += int(valid_values.size)
+            numeric_value_sum += float(valid_values.sum())
+            current_min = float(valid_values.min())
+            current_max = float(valid_values.max())
+            numeric_value_min = current_min if numeric_value_min is None else min(numeric_value_min, current_min)
+            numeric_value_max = current_max if numeric_value_max is None else max(numeric_value_max, current_max)
 
     first_sheet = next(iter(parsed_sheets.values()), {})
     chart_point_count = 0
@@ -99,13 +222,13 @@ def parse_excel_file(file_path) -> dict:
         "rated_voltage_unit": first_sheet.get("rated_voltage_unit", ""),
         "rated_frequency": _safe_float(first_sheet.get("rated_frequency"), 0.0),
         "rated_frequency_unit": first_sheet.get("rated_frequency_unit", ""),
-        "numeric_value_count": len(numeric_values),
+        "numeric_value_count": numeric_value_count,
         "chart_point_count": chart_point_count,
         "chart_value_count": chart_value_count,
         "error_value_count": error_value_count,
-        "max_numeric_value": max(numeric_values) if numeric_values else 0.0,
-        "min_numeric_value": min(numeric_values) if numeric_values else 0.0,
-        "avg_numeric_value": mean(numeric_values) if numeric_values else 0.0,
+        "max_numeric_value": numeric_value_max if numeric_value_max is not None else 0.0,
+        "min_numeric_value": numeric_value_min if numeric_value_min is not None else 0.0,
+        "avg_numeric_value": (numeric_value_sum / numeric_value_count) if numeric_value_count else 0.0,
         "parsed_data": parsed_sheets,
         "summary": summary,
     }
@@ -348,5 +471,7 @@ def analyze_image_file(file_path, file_name: str = "", description: str = "") ->
 
 def dumps_json(data) -> str:
     return json.dumps(data, ensure_ascii=False)
+
+
 
 

@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 import shutil
 import asyncio
 import secrets
+import time
 
 from app.config_ini import config
 from app.logger import logger
@@ -35,9 +36,12 @@ from app.feature_services import (
 from app.server_processing_runtime import (
     start_processing_workers,
     stop_processing_workers,
+    get_processing_worker_status,
+    notify_processing_worker,
     serialize_excel_record,
     serialize_image_record,
 )
+from app.alarm_latency_test_service import process_alarm_latency_test
 
 app = FastAPI(title="三相表数据管理系统")
 app.mount("/uploads", StaticFiles(directory=str(config.upload_dir.resolve()), check_dir=False), name="uploads")
@@ -60,6 +64,65 @@ async def shutdown_event():
     # 关闭服务时优雅停止后台解析线程，避免残留轮询任务。
     stop_processing_workers()
     logger.info("Server shutting down")
+
+
+@app.get("/api/processing/workers/status")
+async def processing_workers_status():
+    """Expose watchdog and worker heartbeat state for server operations."""
+    return get_processing_worker_status()
+
+
+@app.get("/api/alarm-latency/{data_type}/{file_id}")
+async def get_alarm_latency_result(data_type: str, file_id: int, db: Session = Depends(get_db)):
+    """Return server-measured rule-evaluation and alarm persistence latency."""
+    normalized_type = str(data_type or "").strip().lower()
+    if normalized_type == "excel":
+        record = db.query(MeterExcelData).filter(MeterExcelData.id == file_id).first()
+        payload = serialize_excel_record(db, record) if record else None
+    elif normalized_type == "image":
+        record = db.query(MeterImageData).filter(MeterImageData.id == file_id).first()
+        payload = serialize_image_record(db, record) if record else None
+    else:
+        raise HTTPException(status_code=400, detail="data_type must be excel or image")
+    if payload is None:
+        raise HTTPException(status_code=404, detail="file record not found")
+    return {
+        "status": "success",
+        "data_type": normalized_type,
+        "file_id": file_id,
+        "file_name": payload.get("file_name"),
+        "processing_status": payload.get("processing_status"),
+        "processing_error": payload.get("processing_error"),
+        "alarm_evaluated": payload.get("alarm_evaluated", False),
+        "alarm_triggered": payload.get("alarm_triggered", False),
+        "alarm_latency_ms": payload.get("alarm_latency_ms"),
+        "alarm_target_ms": payload.get("alarm_target_ms", 1000.0),
+        "alarm_target_met": payload.get("alarm_target_met", False),
+        "alarm_info": payload.get("alarm_info", {}),
+        "processed_at": payload.get("processed_at"),
+    }
+
+@app.post("/api/alarm-latency/test")
+async def run_alarm_latency_test(file: UploadFile = File(...)):
+    """处理临时性能测试文件；不创建正式文件记录，处理完成后立即删除文件。"""
+    try:
+        file_bytes = await file.read()
+        if not file_bytes:
+            raise HTTPException(status_code=400, detail="上传文件不能为空")
+        return await asyncio.to_thread(
+            process_alarm_latency_test, file_bytes, file.filename or "test_file"
+        )
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.opt(exception=True).error(
+            f"Alarm latency test failed: file_name={file.filename}, "
+            f"error_type={type(exc).__name__}, error={exc}"
+        )
+        raise HTTPException(status_code=500, detail=f"报警延迟测试失败: {exc}") from exc
+
 
 
 @app.post("/api/admin/verify-password")
@@ -410,6 +473,7 @@ async def upload_excel_data(
             location=location_value,
             description=description or f"电量数据 - {timestamp}",
             processing_status="pending",
+            alarm_clock_started_ns=time.time_ns(),
         )
 
         db.add(excel_record)
@@ -428,6 +492,8 @@ async def upload_excel_data(
         )
         db.add(notification)
         db.commit()
+        # 文件和上传通知提交完成后立即唤醒 Excel 处理器，避免等待轮询周期。
+        notify_processing_worker("excel", excel_record.id)
 
         file_info = {
             "file_id": excel_record.id,
@@ -447,6 +513,7 @@ async def upload_excel_data(
             "file_name": filename,
             "file_size": file_size,
             "processing_status": "pending",
+            "alarm_target_ms": 1000.0,
         }
     except HTTPException:
         raise
@@ -549,6 +616,7 @@ async def upload_image_data(
             image_type=image_type,
             compression_ratio=compression_ratio,
             processing_status="pending",
+            alarm_clock_started_ns=time.time_ns(),
         )
 
         db.add(image_record)
@@ -567,6 +635,8 @@ async def upload_image_data(
         )
         db.add(notification)
         db.commit()
+        # 文件和上传通知提交完成后立即唤醒图片处理器。
+        notify_processing_worker("image", image_record.id)
 
         file_info = {
             "file_id": image_record.id,
@@ -595,6 +665,7 @@ async def upload_image_data(
             "compression_ratio": compression_ratio,
             "image_type": image_type,
             "processing_status": "pending",
+            "alarm_target_ms": 1000.0,
         }
     except HTTPException:
         raise

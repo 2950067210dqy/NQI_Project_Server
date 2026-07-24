@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -30,49 +31,376 @@ from app.feature_services import (
     upsert_search_index,
     remember_polling_notification,
 )
+from app.config_ini import config
 from app.logger import logger
 
-PROCESSING_POLL_INTERVAL = 2
+PROCESSING_POLL_INTERVAL = config.processing_poll_interval
+PROCESSOR_SUPERVISOR_INTERVAL = config.processing_supervisor_interval
+PROCESSOR_HEARTBEAT_TIMEOUT = config.processing_heartbeat_timeout
+PROCESSOR_ERROR_BACKOFF_MAX = config.processing_error_backoff_max
+PROCESSOR_STATUS_LOG_INTERVAL = config.processing_status_log_interval
+
 processor_stop_event = threading.Event()
+processor_lock = threading.RLock()
 excel_processor_thread = None
 image_processor_thread = None
+processor_supervisor_thread = None
+_worker_wake_events = {
+    "excel": threading.Event(),
+    "image": threading.Event(),
+}
+
+_worker_states = {
+    "excel": {
+        "status": "not_started",
+        "last_heartbeat": None,
+        "_heartbeat_monotonic": 0.0,
+        "processed_cycles": 0,
+        "error_count": 0,
+        "consecutive_errors": 0,
+        "restart_count": 0,
+        "last_error": None,
+        "current_task": None,
+        "stale_reported": False,
+    },
+    "image": {
+        "status": "not_started",
+        "last_heartbeat": None,
+        "_heartbeat_monotonic": 0.0,
+        "processed_cycles": 0,
+        "error_count": 0,
+        "consecutive_errors": 0,
+        "restart_count": 0,
+        "last_error": None,
+        "current_task": None,
+        "stale_reported": False,
+    },
+}
+
+
+def _thread_for_worker(worker_name: str):
+    return excel_processor_thread if worker_name == "excel" else image_processor_thread
+
+
+def _set_thread_for_worker(worker_name: str, thread):
+    global excel_processor_thread, image_processor_thread
+    if worker_name == "excel":
+        excel_processor_thread = thread
+    else:
+        image_processor_thread = thread
+
+
+def _update_worker_state(worker_name: str, **changes):
+    now_monotonic = time.monotonic()
+    with processor_lock:
+        state = _worker_states[worker_name]
+        state.update(changes)
+        state["last_heartbeat"] = datetime.now().isoformat(timespec="seconds")
+        state["_heartbeat_monotonic"] = now_monotonic
+        state["stale_reported"] = False
+
+
+def _start_worker_locked(worker_name: str, reason: str):
+    target = _excel_worker_loop if worker_name == "excel" else _image_worker_loop
+    state = _worker_states[worker_name]
+    if reason != "server_startup":
+        state["restart_count"] += 1
+    state["status"] = "starting"
+    state["last_error"] = None
+    thread = threading.Thread(
+        target=target,
+        name=f"{worker_name}_processor",
+        daemon=True,
+    )
+    _set_thread_for_worker(worker_name, thread)
+    thread.start()
+    logger.info(
+        f"[processor-supervisor] worker started: worker={worker_name}, "
+        f"reason={reason}, thread_name={thread.name}, thread_id={thread.ident}, "
+        f"restart_count={state['restart_count']}"
+    )
+
+
+def _ensure_worker_locked(worker_name: str, reason: str):
+    thread = _thread_for_worker(worker_name)
+    if thread is None or not thread.is_alive():
+        _start_worker_locked(worker_name, reason)
 
 
 def start_processing_workers():
-    """启动服务端后台处理线程。"""
-    global excel_processor_thread, image_processor_thread
+    """Start parsing workers and the watchdog that keeps them alive."""
+    global processor_supervisor_thread
     processor_stop_event.clear()
-    if excel_processor_thread is None or not excel_processor_thread.is_alive():
-        excel_processor_thread = threading.Thread(target=_excel_worker_loop, name="excel_processor", daemon=True)
-        excel_processor_thread.start()
-    if image_processor_thread is None or not image_processor_thread.is_alive():
-        image_processor_thread = threading.Thread(target=_image_worker_loop, name="image_processor", daemon=True)
-        image_processor_thread.start()
+    # A previous graceful shutdown sets these events to release waiting workers.
+    # Clear them before restart so workers wait for a real upload notification.
+    for wake_event in _worker_wake_events.values():
+        wake_event.clear()
+    with processor_lock:
+        _ensure_worker_locked("excel", "server_startup")
+        _ensure_worker_locked("image", "server_startup")
+        if processor_supervisor_thread is None or not processor_supervisor_thread.is_alive():
+            processor_supervisor_thread = threading.Thread(
+                target=_processor_supervisor_loop,
+                name="processor_supervisor",
+                daemon=True,
+            )
+            processor_supervisor_thread.start()
+            logger.info(
+                f"[processor-supervisor] watchdog started: "
+                f"thread_id={processor_supervisor_thread.ident}, "
+                f"check_interval={PROCESSOR_SUPERVISOR_INTERVAL}s, "
+                f"heartbeat_timeout={PROCESSOR_HEARTBEAT_TIMEOUT}s"
+            )
 
 
 def stop_processing_workers():
-    """停止服务端后台处理线程。"""
+    """Stop the watchdog and both parsing workers gracefully."""
+    global excel_processor_thread, image_processor_thread, processor_supervisor_thread
+    logger.info("[processor-supervisor] shutdown requested")
     processor_stop_event.set()
-    for thread in (excel_processor_thread, image_processor_thread):
-        if thread and thread.is_alive():
-            thread.join(timeout=3)
+    for wake_event in _worker_wake_events.values():
+        wake_event.set()
+    threads = (processor_supervisor_thread, excel_processor_thread, image_processor_thread)
+    for thread in threads:
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=5)
+            if thread.is_alive():
+                logger.warning(
+                    f"[processor-supervisor] thread did not stop within timeout: "
+                    f"name={thread.name}, thread_id={thread.ident}"
+                )
+    with processor_lock:
+        processor_supervisor_thread = None
+        excel_processor_thread = None
+        image_processor_thread = None
+    logger.info("[processor-supervisor] shutdown completed")
+
+
+def _excel_processing_cycle() -> bool:
+    processed = process_next_excel_record()
+    if not processed:
+        processed = process_next_excel_detail_backfill()
+    return processed
+
+
+def _image_processing_cycle() -> bool:
+    return process_next_image_record()
+
+
+def notify_processing_worker(data_type: str, file_id: int = None):
+    """Wake the matching worker immediately after an upload is committed."""
+    worker_name = "excel" if str(data_type).lower() == "excel" else "image"
+    _worker_wake_events[worker_name].set()
+    logger.info(
+        f"[processor-dispatch] immediate wake requested: "
+        f"worker={worker_name}, file_id={file_id}"
+    )
+
+
+def _wait_for_worker_signal(worker_name: str, timeout: float):
+    wake_event = _worker_wake_events[worker_name]
+    wake_event.wait(timeout)
+    wake_event.clear()
+
+
+def _complete_alarm_timing(record, alarm_triggered: bool) -> float:
+    """Persist rule-evaluation latency using a cross-process nanosecond clock."""
+    finished_ns = time.time_ns()
+    started_ns = getattr(record, "alarm_clock_started_ns", None)
+    if not started_ns:
+        upload_time = getattr(record, "upload_time", None)
+        started_ns = int(upload_time.timestamp() * 1_000_000_000) if upload_time else finished_ns
+    latency_ms = max(0.0, (finished_ns - int(started_ns)) / 1_000_000)
+    record.alarm_clock_started_ns = int(started_ns)
+    record.alarm_clock_finished_ns = finished_ns
+    record.alarm_latency_ms = round(latency_ms, 3)
+    record.alarm_triggered = bool(alarm_triggered)
+    return record.alarm_latency_ms
+
+
+def _run_worker_loop(worker_name: str, process_cycle):
+    thread = threading.current_thread()
+    _update_worker_state(worker_name, status="running")
+    logger.info(
+        f"[{thread.name}] loop entered: thread_id={thread.ident}, "
+        f"poll_interval={PROCESSING_POLL_INTERVAL}s"
+    )
+    try:
+        while not processor_stop_event.is_set():
+            _update_worker_state(worker_name, status="checking", current_task=None)
+            try:
+                processed = bool(process_cycle())
+            except Exception as exc:
+                with processor_lock:
+                    state = _worker_states[worker_name]
+                    state["status"] = "retry_wait"
+                    state["error_count"] += 1
+                    state["consecutive_errors"] += 1
+                    state["last_error"] = f"{type(exc).__name__}: {exc}"
+                    state["last_heartbeat"] = datetime.now().isoformat(timespec="seconds")
+                    state["_heartbeat_monotonic"] = time.monotonic()
+                    consecutive_errors = state["consecutive_errors"]
+                backoff = min(
+                    PROCESSOR_ERROR_BACKOFF_MAX,
+                    max(PROCESSING_POLL_INTERVAL, 2 ** min(consecutive_errors - 1, 5)),
+                )
+                logger.opt(exception=True).error(
+                    f"[{thread.name}] worker cycle failed but loop remains alive: "
+                    f"error_type={type(exc).__name__}, error={exc}, "
+                    f"consecutive_errors={consecutive_errors}, retry_in={backoff}s"
+                )
+                processor_stop_event.wait(backoff)
+                continue
+            except BaseException as exc:
+                with processor_lock:
+                    state = _worker_states[worker_name]
+                    state["status"] = "crashed"
+                    state["last_error"] = f"{type(exc).__name__}: {exc}"
+                    state["last_heartbeat"] = datetime.now().isoformat(timespec="seconds")
+                    state["_heartbeat_monotonic"] = time.monotonic()
+                logger.opt(exception=True).critical(
+                    f"[{thread.name}] worker terminated by non-standard exception: "
+                    f"error_type={type(exc).__name__}, error={exc}; watchdog will restart it"
+                )
+                raise
+
+            with processor_lock:
+                state = _worker_states[worker_name]
+                state["consecutive_errors"] = 0
+                state["last_error"] = None
+                if processed:
+                    state["processed_cycles"] += 1
+            if processed:
+                _update_worker_state(worker_name, status="processing_next")
+            else:
+                _update_worker_state(worker_name, status="idle")
+                _wait_for_worker_signal(worker_name, PROCESSING_POLL_INTERVAL)
+    finally:
+        status = "stopped" if processor_stop_event.is_set() else "crashed"
+        _update_worker_state(worker_name, status=status)
+        log_method = logger.info if processor_stop_event.is_set() else logger.error
+        log_method(
+            f"[{thread.name}] loop exited: thread_id={thread.ident}, status={status}"
+        )
 
 
 def _excel_worker_loop():
-    while not processor_stop_event.is_set():
-        processed = process_next_excel_record()
-        if not processed:
-            # 兼容旧数据：没有待解析文件时，继续把旧 parsed_data_json 回填到明细表。
-            processed = process_next_excel_detail_backfill()
-        if not processed:
-            processor_stop_event.wait(PROCESSING_POLL_INTERVAL)
+    _run_worker_loop("excel", _excel_processing_cycle)
 
 
 def _image_worker_loop():
-    while not processor_stop_event.is_set():
-        processed = process_next_image_record()
-        if not processed:
-            processor_stop_event.wait(PROCESSING_POLL_INTERVAL)
+    _run_worker_loop("image", _image_processing_cycle)
+
+
+def _processing_queue_snapshot() -> dict:
+    db = SessionLocal()
+    try:
+        snapshot = {}
+        for worker_name, model in (("excel", MeterExcelData), ("image", MeterImageData)):
+            snapshot[worker_name] = {
+                status: db.query(model).filter(model.processing_status == status).count()
+                for status in ("pending", "processing", "done", "failed")
+            }
+        return snapshot
+    finally:
+        db.close()
+
+
+def _log_processor_status():
+    status = get_processing_worker_status()
+    try:
+        queue = _processing_queue_snapshot()
+    except Exception as exc:
+        logger.opt(exception=True).error(
+            f"[processor-supervisor] failed to read queue snapshot: "
+            f"error_type={type(exc).__name__}, error={exc}"
+        )
+        queue = {"excel": "unavailable", "image": "unavailable"}
+
+    logger.info(
+        f"[processor-supervisor] health report: "
+        f"excel={status['workers']['excel']}, excel_queue={queue['excel']}; "
+        f"image={status['workers']['image']}, image_queue={queue['image']}"
+    )
+
+
+def _processor_supervisor_loop():
+    logger.info("[processor-supervisor] watchdog loop entered")
+    next_status_log = time.monotonic()
+    try:
+        while not processor_stop_event.wait(PROCESSOR_SUPERVISOR_INTERVAL):
+            try:
+                with processor_lock:
+                    for worker_name in ("excel", "image"):
+                        thread = _thread_for_worker(worker_name)
+                        state = _worker_states[worker_name]
+                        if thread is None or not thread.is_alive():
+                            logger.error(
+                                f"[processor-supervisor] worker offline, restarting: "
+                                f"worker={worker_name}, previous_status={state['status']}, "
+                                f"last_heartbeat={state['last_heartbeat']}, "
+                                f"last_error={state['last_error']}"
+                            )
+                            _start_worker_locked(worker_name, "worker_offline")
+                            continue
+
+                        heartbeat_age = time.monotonic() - state["_heartbeat_monotonic"]
+                        if (
+                            state["_heartbeat_monotonic"] > 0
+                            and heartbeat_age > PROCESSOR_HEARTBEAT_TIMEOUT
+                            and not state["stale_reported"]
+                        ):
+                            state["stale_reported"] = True
+                            logger.critical(
+                                f"[processor-supervisor] worker heartbeat is stale: "
+                                f"worker={worker_name}, thread_id={thread.ident}, "
+                                f"status={state['status']}, heartbeat_age={heartbeat_age:.1f}s. "
+                                f"The thread is alive but may be blocked in file or database I/O."
+                            )
+
+                if time.monotonic() >= next_status_log:
+                    _log_processor_status()
+                    next_status_log = time.monotonic() + PROCESSOR_STATUS_LOG_INTERVAL
+            except Exception as exc:
+                logger.opt(exception=True).error(
+                    f"[processor-supervisor] watchdog check failed; monitoring continues: "
+                    f"error_type={type(exc).__name__}, error={exc}"
+                )
+    finally:
+        logger.info("[processor-supervisor] watchdog loop exited")
+
+
+def get_processing_worker_status() -> dict:
+    """Return a JSON-serializable snapshot for operations and health checks."""
+    now = time.monotonic()
+    with processor_lock:
+        workers = {}
+        for worker_name in ("excel", "image"):
+            thread = _thread_for_worker(worker_name)
+            state = _worker_states[worker_name]
+            heartbeat_monotonic = state["_heartbeat_monotonic"]
+            workers[worker_name] = {
+                key: value
+                for key, value in state.items()
+                if not key.startswith("_") and key != "stale_reported"
+            }
+            workers[worker_name].update({
+                "alive": bool(thread and thread.is_alive()),
+                "thread_name": thread.name if thread else None,
+                "thread_id": thread.ident if thread else None,
+                "heartbeat_age_seconds": (
+                    round(max(0.0, now - heartbeat_monotonic), 3)
+                    if heartbeat_monotonic
+                    else None
+                ),
+            })
+        supervisor = processor_supervisor_thread
+        return {
+            "stop_requested": processor_stop_event.is_set(),
+            "supervisor_alive": bool(supervisor and supervisor.is_alive()),
+            "supervisor_thread_id": supervisor.ident if supervisor else None,
+            "workers": workers,
+        }
 
 
 
@@ -125,10 +453,17 @@ def _abs_summary(values: list[float]) -> dict:
     return _summarize_values([abs(value) for value in values if value is not None])
 
 
-def _build_excel_detail_rows_and_metrics(payload: dict, record: MeterExcelData, parse_result_id: int):
+def _build_excel_detail_rows_and_metrics(
+    payload: dict,
+    record: MeterExcelData,
+    parse_result_id: int,
+    include_rows: bool = True,
+):
     """把 parsed_data_json 进一步拆成行级图表柱值和误差明细，并生成精细预警指标。"""
     rows = []
     error_rows = []
+    row_count = 0
+    error_row_count = 0
     values_by_metric = defaultdict(list)
     values_by_sheet_metric = defaultdict(lambda: defaultdict(list))
     errors_by_metric_percent = defaultdict(list)
@@ -171,31 +506,33 @@ def _build_excel_detail_rows_and_metrics(payload: dict, record: MeterExcelData, 
                             x_current = _safe_float(x_point[1])
                         values_by_metric[metric_key].append(value)
                         values_by_sheet_metric[str(sheet_name)][metric_key].append(value)
-                        rows.append(MeterExcelMeasurementDetail(
-                            excel_id=record.id,
-                            parse_result_id=parse_result_id,
-                            device_id=record.device_id,
-                            sheet_name=str(sheet_name),
-                            metric_group_index=metric_group_index,
-                            metric_name=str(metric_name),
-                            metric_key=metric_key,
-                            phase_name=str(phase_name),
-                            phase_index=phase_index,
-                            meter_name=str(meter_name),
-                            meter_index=meter_index,
-                            point_index=int(meta.get("point_index", point_index) or 0),
-                            source_excel_row=meta.get("source_excel_row"),
-                            range_text=meta.get("range_text"),
-                            frequency_hz=_safe_float(meta.get("frequency_hz")),
-                            rated_voltage_v=_safe_float(meta.get("rated_voltage_v")) or rated_voltage,
-                            rated_current_a=x_current,
-                            x_angle_degree=x_angle,
-                            x_current_a=x_current,
-                            value_unit=str(value_unit),
-                            chart_series_name=f"{phase_name}-{meter_name}",
-                            value=value,
-                            processed_at=processed_at,
-                        ))
+                        row_count += 1
+                        if include_rows:
+                            rows.append(MeterExcelMeasurementDetail(
+                                excel_id=record.id,
+                                parse_result_id=parse_result_id,
+                                device_id=record.device_id,
+                                sheet_name=str(sheet_name),
+                                metric_group_index=metric_group_index,
+                                metric_name=str(metric_name),
+                                metric_key=metric_key,
+                                phase_name=str(phase_name),
+                                phase_index=phase_index,
+                                meter_name=str(meter_name),
+                                meter_index=meter_index,
+                                point_index=int(meta.get("point_index", point_index) or 0),
+                                source_excel_row=meta.get("source_excel_row"),
+                                range_text=meta.get("range_text"),
+                                frequency_hz=_safe_float(meta.get("frequency_hz")),
+                                rated_voltage_v=_safe_float(meta.get("rated_voltage_v")) or rated_voltage,
+                                rated_current_a=x_current,
+                                x_angle_degree=x_angle,
+                                x_current_a=x_current,
+                                value_unit=str(value_unit),
+                                chart_series_name=f"{phase_name}-{meter_name}",
+                                value=value,
+                                processed_at=processed_at,
+                            ))
 
         for error_item in sheet_payload.get("error_data", []) or []:
             metric_name = error_item.get("metric_name", "")
@@ -213,32 +550,34 @@ def _build_excel_detail_rows_and_metrics(payload: dict, record: MeterExcelData, 
                 errors_by_metric_ppm[metric_key].append(error_ppm)
                 errors_by_sheet_metric_ppm[str(sheet_name)][metric_key].append(error_ppm)
                 errors_by_sheet_phase_metric_ppm[sheet_key][phase_key][metric_key].append(error_ppm)
-            error_rows.append(MeterExcelErrorDetail(
-                excel_id=record.id,
-                parse_result_id=parse_result_id,
-                device_id=record.device_id,
-                sheet_name=str(sheet_name),
-                metric_group_index=int(error_item.get("metric_group_index") or 0),
-                metric_name=str(metric_name),
-                metric_key=metric_key,
-                phase_name=phase_name,
-                phase_index=int(error_item.get("phase_index") or 0),
-                point_index=int(error_item.get("point_index") or 0),
-                source_excel_row=error_item.get("source_excel_row"),
-                range_text=error_item.get("range_text"),
-                frequency_hz=_safe_float(error_item.get("frequency_hz")),
-                rated_voltage_v=_safe_float(error_item.get("rated_voltage_v")),
-                rated_current_a=_safe_float(error_item.get("rated_current_a")),
-                x_angle_degree=_safe_float(error_item.get("phase_angle_degree")),
-                x_current_a=_safe_float(error_item.get("rated_current_a")),
-                reference_meter_name=str(error_item.get("reference_meter_name", "")),
-                compared_meter_name=str(error_item.get("compared_meter_name", "")),
-                reference_value=_safe_float(error_item.get("reference_value")),
-                compared_value=_safe_float(error_item.get("compared_value")),
-                error_percent=error_percent,
-                error_ppm=error_ppm,
-                processed_at=processed_at,
-            ))
+            error_row_count += 1
+            if include_rows:
+                error_rows.append(MeterExcelErrorDetail(
+                    excel_id=record.id,
+                    parse_result_id=parse_result_id,
+                    device_id=record.device_id,
+                    sheet_name=str(sheet_name),
+                    metric_group_index=int(error_item.get("metric_group_index") or 0),
+                    metric_name=str(metric_name),
+                    metric_key=metric_key,
+                    phase_name=phase_name,
+                    phase_index=int(error_item.get("phase_index") or 0),
+                    point_index=int(error_item.get("point_index") or 0),
+                    source_excel_row=error_item.get("source_excel_row"),
+                    range_text=error_item.get("range_text"),
+                    frequency_hz=_safe_float(error_item.get("frequency_hz")),
+                    rated_voltage_v=_safe_float(error_item.get("rated_voltage_v")),
+                    rated_current_a=_safe_float(error_item.get("rated_current_a")),
+                    x_angle_degree=_safe_float(error_item.get("phase_angle_degree")),
+                    x_current_a=_safe_float(error_item.get("rated_current_a")),
+                    reference_meter_name=str(error_item.get("reference_meter_name", "")),
+                    compared_meter_name=str(error_item.get("compared_meter_name", "")),
+                    reference_value=_safe_float(error_item.get("reference_value")),
+                    compared_value=_safe_float(error_item.get("compared_value")),
+                    error_percent=error_percent,
+                    error_ppm=error_ppm,
+                    processed_at=processed_at,
+                ))
 
     detail_summary = {
         "metrics": {metric_key: _summarize_values(values) for metric_key, values in values_by_metric.items()},
@@ -253,8 +592,8 @@ def _build_excel_detail_rows_and_metrics(payload: dict, record: MeterExcelData, 
             }
             for metric_key in set(errors_by_metric_percent.keys()) | set(errors_by_metric_ppm.keys())
         },
-        "row_count": len(rows),
-        "error_row_count": len(error_rows),
+        "row_count": row_count,
+        "error_row_count": error_row_count,
     }
     alarm_metrics = {}
     for metric_key, summary in detail_summary["metrics"].items():
@@ -344,6 +683,23 @@ def process_next_excel_record() -> bool:
         db.commit()
         db.refresh(record)
         record_id = record.id
+        task_started = time.monotonic()
+        _update_worker_state(
+            "excel",
+            status="processing",
+            current_task={
+                "id": record.id,
+                "device_id": record.device_id,
+                "file_name": record.file_name,
+                "file_path": record.file_path,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        logger.info(
+            f"[excel_processor] task claimed: id={record.id}, device_id={record.device_id}, "
+            f"file_name={record.file_name}, file_path={record.file_path}, "
+            f"file_size={record.file_size}, upload_time={record.upload_time}"
+        )
 
         try:
             payload = parse_excel_file(record.file_path)
@@ -385,9 +741,9 @@ def process_next_excel_record() -> bool:
             parse_result.error_value_count = detail_summary.get("error_row_count", 0)
             parse_result.detail_summary_json = dumps_json(detail_summary)
 
-            record.processing_status = "done"
+            record.processing_status = "processing"
             record.processing_error = None
-            record.processed_at = datetime.now()
+            record.processed_at = None
             db.commit()
             db.refresh(record)
 
@@ -410,8 +766,16 @@ def process_next_excel_record() -> bool:
             fault_record = sync_fault_record(db, "excel", record, detected_fault, fault_summary, severity=rule_severity)
             if detected_fault:
                 _emit_fault_alarm(db, "excel", record, fault_summary, fault_record.id if fault_record else None)
-            # 预警记录和通知属于解析结果的一部分，必须在本次处理结束前明确落库。
+            alarm_latency_ms = _complete_alarm_timing(record, detected_fault)
+            record.processing_status = "done"
+            record.processed_at = datetime.now()
+            # 预警记录、通知和延迟结果属于同一处理结果，统一提交后才对客户端显示 done。
             db.commit()
+            logger.info(
+                f"[excel_processor] alarm evaluation completed: id={record.id}, "
+                f"alarm_triggered={detected_fault}, alarm_latency_ms={alarm_latency_ms:.3f}, "
+                f"target_met={alarm_latency_ms < 1000.0}"
+            )
 
             remember_polling_notification({
                 "type": "excel_processed",
@@ -423,7 +787,21 @@ def process_next_excel_record() -> bool:
                 "processing_status": "done",
                 "timestamp": datetime.now().isoformat(),
             })
+            logger.info(
+                f"[excel_processor] task completed: id={record.id}, device_id={record.device_id}, "
+                f"elapsed={time.monotonic() - task_started:.3f}s, "
+                f"sheet_count={payload.get('sheet_count', 0)}, "
+                f"detail_rows={detail_summary.get('row_count', 0)}, "
+                f"error_rows={detail_summary.get('error_row_count', 0)}, "
+                f"detected_fault={detected_fault}"
+            )
         except Exception as exc:
+            logger.opt(exception=True).error(
+                f"[excel_processor] task processing failed: id={record_id}, "
+                f"file_path={getattr(record, 'file_path', None)}, "
+                f"elapsed={time.monotonic() - task_started:.3f}s, "
+                f"error_type={type(exc).__name__}, error={exc}"
+            )
             # 当前事务可能已经在 flush/commit 阶段失败，必须先回滚再写失败状态。
             db.rollback()
             record = db.query(MeterExcelData).filter(MeterExcelData.id == record_id).first()
@@ -431,9 +809,9 @@ def process_next_excel_record() -> bool:
                 logger.error(f"Excel processing failed and source record missing: id={record_id}, error={exc}")
                 return True
 
-            record.processing_status = "failed"
+            record.processing_status = "processing"
             record.processing_error = str(exc)
-            record.processed_at = datetime.now()
+            record.processed_at = None
             db.commit()
 
             metrics = {"processing_failed": 1}
@@ -442,7 +820,14 @@ def process_next_excel_record() -> bool:
             upsert_search_index(db, "excel", record, record.location, True, fault_summary)
             fault_record = sync_fault_record(db, "excel", record, True, fault_summary, severity=rule_severity or "critical")
             _emit_fault_alarm(db, "excel", record, fault_summary, fault_record.id if fault_record else None)
+            alarm_latency_ms = _complete_alarm_timing(record, True)
+            record.processing_status = "failed"
+            record.processed_at = datetime.now()
             db.commit()
+            logger.warning(
+                f"[excel_processor] failure alarm persisted: id={record.id}, "
+                f"alarm_latency_ms={alarm_latency_ms:.3f}, target_met={alarm_latency_ms < 1000.0}"
+            )
             remember_polling_notification({
                 "type": "excel_processed",
                 "device_id": record.device_id,
@@ -453,6 +838,11 @@ def process_next_excel_record() -> bool:
                 "processing_status": "failed",
                 "timestamp": datetime.now().isoformat(),
             })
+            logger.warning(
+                f"[excel_processor] task marked failed: id={record.id}, "
+                f"elapsed={time.monotonic() - task_started:.3f}s, "
+                f"processing_error={record.processing_error}"
+            )
         return True
     finally:
         db.close()
@@ -526,7 +916,10 @@ def process_next_excel_detail_backfill() -> bool:
         return True
     except Exception as exc:
         db.rollback()
-        logger.error(f"Excel detail backfill failed: {exc}")
+        logger.opt(exception=True).error(
+            f"[excel_processor] detail backfill failed: "
+            f"error_type={type(exc).__name__}, error={exc}"
+        )
         return True
     finally:
         db.close()
@@ -546,6 +939,23 @@ def process_next_image_record() -> bool:
         db.commit()
         db.refresh(record)
         record_id = record.id
+        task_started = time.monotonic()
+        _update_worker_state(
+            "image",
+            status="processing",
+            current_task={
+                "id": record.id,
+                "device_id": record.device_id,
+                "file_name": record.file_name,
+                "file_path": record.file_path,
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+            },
+        )
+        logger.info(
+            f"[image_processor] task claimed: id={record.id}, device_id={record.device_id}, "
+            f"file_name={record.file_name}, file_path={record.file_path}, "
+            f"file_size={record.file_size}, upload_time={record.upload_time}"
+        )
 
         try:
             payload = analyze_image_file(record.file_path, record.file_name, record.description or "")
@@ -571,9 +981,9 @@ def process_next_image_record() -> bool:
             analysis_result.analysis_data_json = dumps_json(payload.get("analysis_data", {}))
             analysis_result.processed_at = datetime.now()
 
-            record.processing_status = "done"
+            record.processing_status = "processing"
             record.processing_error = None
-            record.processed_at = datetime.now()
+            record.processed_at = None
             db.commit()
             db.refresh(record)
 
@@ -592,7 +1002,15 @@ def process_next_image_record() -> bool:
             fault_record = sync_fault_record(db, "image", record, detected_fault, fault_summary, severity=rule_severity)
             if detected_fault:
                 _emit_fault_alarm(db, "image", record, fault_summary, fault_record.id if fault_record else None)
+            alarm_latency_ms = _complete_alarm_timing(record, detected_fault)
+            record.processing_status = "done"
+            record.processed_at = datetime.now()
             db.commit()
+            logger.info(
+                f"[image_processor] alarm evaluation completed: id={record.id}, "
+                f"alarm_triggered={detected_fault}, alarm_latency_ms={alarm_latency_ms:.3f}, "
+                f"target_met={alarm_latency_ms < 1000.0}"
+            )
 
             remember_polling_notification({
                 "type": "image_processed",
@@ -606,7 +1024,20 @@ def process_next_image_record() -> bool:
                 "processing_status": "done",
                 "timestamp": datetime.now().isoformat(),
             })
+            logger.info(
+                f"[image_processor] task completed: id={record.id}, device_id={record.device_id}, "
+                f"elapsed={time.monotonic() - task_started:.3f}s, "
+                f"image_size={payload.get('image_width', 0)}x{payload.get('image_height', 0)}, "
+                f"has_fault={payload.get('has_fault', False)}, "
+                f"detected_fault={detected_fault}"
+            )
         except Exception as exc:
+            logger.opt(exception=True).error(
+                f"[image_processor] task processing failed: id={record_id}, "
+                f"file_path={getattr(record, 'file_path', None)}, "
+                f"elapsed={time.monotonic() - task_started:.3f}s, "
+                f"error_type={type(exc).__name__}, error={exc}"
+            )
             # 当前事务可能已经在 flush/commit 阶段失败，必须先回滚再写失败状态。
             db.rollback()
             record = db.query(MeterImageData).filter(MeterImageData.id == record_id).first()
@@ -614,9 +1045,9 @@ def process_next_image_record() -> bool:
                 logger.error(f"Image processing failed and source record missing: id={record_id}, error={exc}")
                 return True
 
-            record.processing_status = "failed"
+            record.processing_status = "processing"
             record.processing_error = str(exc)
-            record.processed_at = datetime.now()
+            record.processed_at = None
             db.commit()
 
             metrics = {"processing_failed": 1}
@@ -625,7 +1056,14 @@ def process_next_image_record() -> bool:
             upsert_search_index(db, "image", record, record.location, True, fault_summary)
             fault_record = sync_fault_record(db, "image", record, True, fault_summary, severity=rule_severity or "critical")
             _emit_fault_alarm(db, "image", record, fault_summary, fault_record.id if fault_record else None)
+            alarm_latency_ms = _complete_alarm_timing(record, True)
+            record.processing_status = "failed"
+            record.processed_at = datetime.now()
             db.commit()
+            logger.warning(
+                f"[image_processor] failure alarm persisted: id={record.id}, "
+                f"alarm_latency_ms={alarm_latency_ms:.3f}, target_met={alarm_latency_ms < 1000.0}"
+            )
             remember_polling_notification({
                 "type": "image_processed",
                 "device_id": record.device_id,
@@ -638,6 +1076,11 @@ def process_next_image_record() -> bool:
                 "processing_status": "failed",
                 "timestamp": datetime.now().isoformat(),
             })
+            logger.warning(
+                f"[image_processor] task marked failed: id={record.id}, "
+                f"elapsed={time.monotonic() - task_started:.3f}s, "
+                f"processing_error={record.processing_error}"
+            )
         return True
     finally:
         db.close()
@@ -748,6 +1191,13 @@ def serialize_excel_record(db: Session, file_record: MeterExcelData, include_par
         "processing_status": file_record.processing_status,
         "processing_error": file_record.processing_error,
         "processed_at": file_record.processed_at.isoformat() if file_record.processed_at else None,
+        "alarm_evaluated": file_record.alarm_clock_finished_ns is not None,
+        "alarm_latency_ms": file_record.alarm_latency_ms,
+        "alarm_triggered": bool(file_record.alarm_triggered),
+        "alarm_target_ms": 1000.0,
+        "alarm_target_met": (
+            file_record.alarm_latency_ms is not None and file_record.alarm_latency_ms < 1000.0
+        ),
         "download_url": f"/api/file/download/excel/{file_record.id}",
         "alarm_info": _build_record_alarm_info(db, "excel", file_record.id),
         "parse_result": {
@@ -788,6 +1238,13 @@ def serialize_image_record(db: Session, file_record: MeterImageData, include_ana
         "processing_status": file_record.processing_status,
         "processing_error": file_record.processing_error,
         "processed_at": file_record.processed_at.isoformat() if file_record.processed_at else None,
+        "alarm_evaluated": file_record.alarm_clock_finished_ns is not None,
+        "alarm_latency_ms": file_record.alarm_latency_ms,
+        "alarm_triggered": bool(file_record.alarm_triggered),
+        "alarm_target_ms": 1000.0,
+        "alarm_target_met": (
+            file_record.alarm_latency_ms is not None and file_record.alarm_latency_ms < 1000.0
+        ),
         "download_url": f"/api/file/download/image/{file_record.id}",
         "alarm_info": _build_record_alarm_info(db, "image", file_record.id),
         "analysis_result": {
@@ -805,3 +1262,8 @@ def serialize_image_record(db: Session, file_record: MeterImageData, include_ana
             "analysis_data": analysis_data,
         }
     }
+
+
+
+
+
