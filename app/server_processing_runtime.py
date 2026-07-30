@@ -21,6 +21,7 @@ from app.database import (
     MeterImageAnalysisResult,
     FaultRecord,
     DataSearchIndex,
+    get_database_pool_snapshot,
 )
 from app.feature_services import (
     create_alarm_notification,
@@ -247,7 +248,8 @@ def _run_worker_loop(worker_name: str, process_cycle):
                 logger.opt(exception=True).error(
                     f"[{thread.name}] worker cycle failed but loop remains alive: "
                     f"error_type={type(exc).__name__}, error={exc}, "
-                    f"consecutive_errors={consecutive_errors}, retry_in={backoff}s"
+                    f"consecutive_errors={consecutive_errors}, retry_in={backoff}s, "
+                    f"database_pool={get_database_pool_snapshot()}"
                 )
                 processor_stop_event.wait(backoff)
                 continue

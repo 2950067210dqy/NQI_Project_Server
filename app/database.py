@@ -470,6 +470,19 @@ def _ensure_legacy_columns():
                 logger.info(f"Applying schema type patch: {ddl}")
                 connection.execute(text(ddl))
 
+def get_database_pool_snapshot() -> dict:
+    """返回连接池即时状态，供后台线程超时日志定位连接占用问题。"""
+    pool = engine.pool
+    snapshot = {"status": pool.status()}
+    for name in ("size", "checkedin", "checkedout", "overflow"):
+        method = getattr(pool, name, None)
+        if callable(method):
+            try:
+                snapshot[name] = method()
+            except Exception as exc:
+                snapshot[name] = f"unavailable: {type(exc).__name__}"
+    return snapshot
+
 def get_db():
     """获取数据库会话；接口异常时回滚并确保连接归还连接池。"""
     db = SessionLocal()

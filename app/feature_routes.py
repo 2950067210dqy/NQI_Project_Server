@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.database import (
-    get_db, Device, DeviceIdReservation, Hardware_Key, DeviceRegistrationRequest,
+    get_db, SessionLocal, Device, DeviceIdReservation, Hardware_Key, DeviceRegistrationRequest,
     Notification, FaultRecord, DataSearchIndex, AlarmRule,
     MeterExcelMeasurementDetail, MeterExcelErrorDetail
 )
@@ -38,19 +38,10 @@ def _notification_to_polling_payload(notification: Notification) -> dict:
     }
 
 
-@router.get("/api/polling/notifications")
-async def polling_notifications_endpoint(
-        client_id: str,
-        timeout: int = 30,
-        device_id: Optional[str] = None,
-        db: Session = Depends(get_db)
-):
-    """Upper client long-polling endpoint for upload, approval, and fault events."""
-    timeout = max(1, min(timeout, 30))
-    deadline = datetime.now() + timedelta(seconds=timeout)
-
-    while True:
-        # 预警通知必须先查数据库未读队列：上位机离线时内存轮询收不到，数据库仍可补发。
+def _load_pending_fault_alarm_notifications(device_id: Optional[str]) -> list[dict]:
+    """短会话读取持久预警队列，长轮询等待期间绝不占用数据库连接。"""
+    db = SessionLocal()
+    try:
         pending_query = db.query(Notification).filter(
             Notification.status == "unread",
             Notification.notification_type == "fault_alarm",
@@ -59,9 +50,34 @@ async def polling_notifications_endpoint(
             pending_query = pending_query.filter(Notification.device_id == device_id)
         # 离线预警分小批补发，避免上位机启动时一次性收到大量 toast/状态栏刷新导致界面崩溃。
         pending_notifications = pending_query.order_by(Notification.id.asc()).limit(10).all()
+        return [_notification_to_polling_payload(item) for item in pending_notifications]
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        # 每轮查询后立即归还连接；不能把会话持有到 30 秒长轮询结束。
+        db.close()
+
+
+@router.get("/api/polling/notifications")
+async def polling_notifications_endpoint(
+        client_id: str,
+        timeout: int = 30,
+        device_id: Optional[str] = None,
+):
+    """HTTP 长轮询：等待消息时不持有数据库连接，避免耗尽 QueuePool。"""
+    timeout = max(1, min(timeout, 30))
+    deadline = datetime.now() + timedelta(seconds=timeout)
+
+    while True:
+        # 上位机离线时内存轮询收不到，持久化未读预警仍可在重新连接后补发。
+        pending_notifications = _load_pending_fault_alarm_notifications(device_id)
         if pending_notifications:
-            notifications = [_notification_to_polling_payload(item) for item in pending_notifications]
-            return {"status": "success", "count": len(notifications), "notifications": notifications}
+            return {
+                "status": "success",
+                "count": len(pending_notifications),
+                "notifications": pending_notifications,
+            }
 
         last_id = polling_client_offsets.get(client_id, 0)
         notifications = [
