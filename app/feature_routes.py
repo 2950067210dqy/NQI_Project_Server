@@ -1,17 +1,19 @@
 import asyncio
+import time
 from datetime import datetime, timedelta
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Body
 from sqlalchemy import and_, desc, func, or_
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
 
 from app.database import (
     get_db, SessionLocal, Device, DeviceIdReservation, Hardware_Key, DeviceRegistrationRequest,
     Notification, FaultRecord, DataSearchIndex, AlarmRule,
-    MeterExcelMeasurementDetail, MeterExcelErrorDetail
+    MeterExcelMeasurementDetail, MeterExcelErrorDetail, get_database_pool_snapshot
 )
+from app.logger import logger
 from app.security import security_manager
 from app.feature_services import (
     ensure_search_index, remember_polling_notification,
@@ -71,7 +73,23 @@ async def polling_notifications_endpoint(
 
     while True:
         # 上位机离线时内存轮询收不到，持久化未读预警仍可在重新连接后补发。
-        pending_notifications = _load_pending_fault_alarm_notifications(device_id)
+        # SQLAlchemy 是同步驱动，放到线程执行以免阻塞 ASGI 事件循环。
+        try:
+            pending_notifications = await asyncio.to_thread(
+                _load_pending_fault_alarm_notifications, device_id
+            )
+        except SQLAlchemyTimeoutError as exc:
+            # 连接池被临时占满时，绝不能把一次轮询升级为 500；保留请求并等待连接归还。
+            remaining_seconds = (deadline - datetime.now()).total_seconds()
+            logger.warning(
+                "Polling notification query deferred because database pool is busy: "
+                f"client_id={client_id}, remaining_seconds={max(0.0, remaining_seconds):.1f}, "
+                f"error={exc}, pool={get_database_pool_snapshot()}"
+            )
+            if remaining_seconds <= 0:
+                return {"status": "success", "count": 0, "notifications": [], "database_busy": True}
+            await asyncio.sleep(min(2.0, max(0.1, remaining_seconds)))
+            continue
         if pending_notifications:
             return {
                 "status": "success",

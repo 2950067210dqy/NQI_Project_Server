@@ -40,6 +40,7 @@ class Config:
                 'max_overflow': '40',
                 'pool_timeout': '10',
                 'pool_recycle': '1800',
+                'checkout_warn_seconds': '15',
             },
             'server': {
                 'host': '0.0.0.0',
@@ -112,6 +113,11 @@ class Config:
     @property
     def db_pool_recycle(self) -> int:
         return self.config.getint('database', 'pool_recycle', fallback=1800)
+
+    @property
+    def db_checkout_warn_seconds(self) -> float:
+        """连接归还前的占用告警阈值，用于定位连接泄漏或慢请求。"""
+        return max(1.0, self.config.getfloat('database', 'checkout_warn_seconds', fallback=15.0))
 
     @property
     def server_host(self) -> str:

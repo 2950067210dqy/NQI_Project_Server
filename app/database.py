@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, BigInteger, Enum, Float, Boolean, inspect, text, Index, CheckConstraint
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, BigInteger, Enum, Float, Boolean, inspect, text, Index, CheckConstraint, event
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.dialects.mysql import LONGTEXT
@@ -6,6 +6,9 @@ from datetime import datetime
 from app.config_ini import config
 from app.logger import logger
 import enum
+import threading
+import time
+import traceback
 
 # 数据库连接字符串
 DATABASE_URL = f"mysql+pymysql://{config.db_user}:{config.db_password}@{config.db_host}:{config.db_port}/{config.db_name}?charset=utf8mb4"
@@ -17,6 +20,9 @@ engine = create_engine(
     max_overflow=config.db_max_overflow,
     pool_timeout=config.db_pool_timeout,
     pool_recycle=config.db_pool_recycle,
+    # Reuse warm connections first and roll back every returned connection.
+    pool_use_lifo=True,
+    pool_reset_on_return="rollback",
     echo=False,
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -26,6 +32,30 @@ logger.info(
     f"recycle={config.db_pool_recycle}s"
 )
 Base = declarative_base()
+
+@event.listens_for(engine, "checkout")
+def _record_connection_checkout(_dbapi_connection, connection_record, _connection_proxy):
+    """Record ownership so a long-held MySQL connection is diagnosable in logs."""
+    connection_record.info["nqi_checked_out_at"] = time.monotonic()
+    connection_record.info["nqi_checkout_thread"] = threading.current_thread().name
+    connection_record.info["nqi_checkout_stack"] = "".join(traceback.format_stack(limit=14))
+
+
+@event.listens_for(engine, "checkin")
+def _report_long_connection_checkout(_dbapi_connection, connection_record):
+    """Log only slow connection ownership; normal check-in remains quiet."""
+    started_at = connection_record.info.pop("nqi_checked_out_at", None)
+    checkout_thread = connection_record.info.pop("nqi_checkout_thread", "unknown")
+    checkout_stack = connection_record.info.pop("nqi_checkout_stack", "")
+    if started_at is None:
+        return
+    held_seconds = time.monotonic() - started_at
+    if held_seconds >= config.db_checkout_warn_seconds:
+        logger.warning(
+            "Database connection returned after long checkout: "
+            f"held_seconds={held_seconds:.3f}, checkout_thread={checkout_thread}, "
+            f"pool={get_database_pool_snapshot()}, checkout_stack=\n{checkout_stack}"
+        )
 
 
 class DataType(str, enum.Enum):
